@@ -3,27 +3,51 @@ name: A135F KSU-Next SUSFS Build
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: a135f-ksu-susfs
+  cancel-in-progress: true
+
 jobs:
   build:
+    name: Build A135F Kernel
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
     env:
       WORKSPACE: ${{ github.workspace }}/kernel_workspace
-      CONFIG_ENV: config.env
+      CONFIG_ENV: ${{ github.workspace }}/config.env
 
     steps:
-      - name: Checkout device repository
+
+      # ---------------------------------------------------------
+      # 1. Checkout our repository
+      # ---------------------------------------------------------
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Clone KernelSU Action build system
+      # ---------------------------------------------------------
+      # 2. Clone the current KernelSU Action build system
+      # ---------------------------------------------------------
+      - name: Get KernelSU Action build system
         run: |
-          git clone --depth=1 https://github.com/xiaoleGun/KernelSU_Action.git build-system
-          mkdir -p kernel_workspace
+          git clone --depth=1 \
+            https://github.com/xiaoleGun/KernelSU_Action.git \
+            build-system
 
+      # ---------------------------------------------------------
+      # 3. Create A135F build configuration
+      # ---------------------------------------------------------
       - name: Create build configuration
         run: |
           cat > config.env <<'EOF'
+
+          # =========================
+          # Kernel source
+          # =========================
+
           KERNEL_SOURCE=https://github.com/Samsung-Galaxy-A13-A135F-Development/android_kernel_samsung_exynos850.git
           KERNEL_SOURCE_BRANCH=lineage-24.0
           KERNEL_CONFIG=exynos850-a13nsxx_defconfig
@@ -31,46 +55,123 @@ jobs:
           ARCH=arm64
 
           KERNEL_NAME=A135F-KSU-SUSFS
+          ADD_LOCALVERSION_TO_FILENAME=false
+
+
+          # =========================
+          # Compiler
+          # =========================
 
           USE_CUSTOM_CLANG=false
+
+          # Recommended by KernelSU_Action for 4.19
           CLANG_BRANCH=master-kernel-build-2022
           CLANG_VERSION=r450784e
 
           USE_LLVM=false
+
           ENABLE_GCC_ARM64=true
           ENABLE_GCC_ARM32=false
 
+          USE_CUSTOM_GCC_64=false
+          USE_CUSTOM_GCC_32=false
+
+
+          # =========================
+          # KernelSU-Next
+          # =========================
+
           KSU_VARIANT=kernelsu-next
+
+          # KernelSU-Next legacy branch
           KSU_REF=legacy
+
+          # 4.19 non-GKI -> manual hooks
           KSU_HOOK_MODE=manual
 
+
+          # =========================
+          # SUSFS
+          # =========================
+
           ENABLE_SUSFS=true
+
+          SUSFS_REPO=https://gitlab.com/simonpunk/susfs4ksu.git
           SUSFS_BRANCH=kernel-4.19
+
+
+          # =========================
+          # KernelSU extras
+          # =========================
 
           ENABLE_PATH_UMOUNT=true
           ENABLE_HIDE_STUFF=false
+          ENABLE_KPM=false
 
-          ADD_OVERLAYFS_CONFIG=true
+
+          # =========================
+          # Kernel config
+          # =========================
+
           ADD_KPROBES_CONFIG=false
+          ADD_OVERLAYFS_CONFIG=true
 
           DISABLE_LTO=false
           DISABLE_CC_WERROR=true
 
+          EXTRA_DEFCONFIG=
+
+
+          # =========================
+          # Packaging
+          # =========================
+
+          USE_CUSTOM_ANYKERNEL3=false
+
+          NEED_DTBO=false
+
+          # We will flash the resulting
+          # AnyKernel3 zip from TWRP.
+          BUILD_BOOT_IMG=false
+          SOURCE_BOOT_IMAGE=
+
+
+          # =========================
+          # Runner
+          # =========================
+
           ENABLE_CCACHE=true
           REMOVE_UNUSED_PACKAGES=true
 
-          BUILD_BOOT_IMG=false
           EOF
 
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential ccache cpio curl \
-            device-tree-compiler flex git libelf-dev \
-            libssl-dev lz4 make python3 rsync unzip zip zstd \
-            libncurses-dev
+          echo "===== CONFIG ====="
+          cat config.env
 
+      # ---------------------------------------------------------
+      # 4. Resolve configuration
+      # ---------------------------------------------------------
+      - name: Resolve configuration
+        run: |
+          bash build-system/scripts/config.sh
+
+      # ---------------------------------------------------------
+      # 5. Free runner storage
+      # ---------------------------------------------------------
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+        with:
+          tool-cache: true
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      # ---------------------------------------------------------
+      # 6. Add swap
+      # ---------------------------------------------------------
       - name: Add swap
         run: |
           sudo fallocate -l 8G /mnt/swapfile
@@ -79,44 +180,122 @@ jobs:
           sudo swapon /mnt/swapfile
           free -h
 
-      - name: Resolve configuration
+      # ---------------------------------------------------------
+      # 7. Install dependencies
+      # ---------------------------------------------------------
+      - name: Install dependencies
         run: |
-          bash build-system/scripts/config.sh
+          sudo apt-get update -qq
 
-      - name: Setup compiler
+          sudo apt-get install -y --no-install-recommends \
+            bc \
+            bison \
+            build-essential \
+            ccache \
+            cpio \
+            curl \
+            device-tree-compiler \
+            flex \
+            git \
+            libelf-dev \
+            libssl-dev \
+            lz4 \
+            make \
+            python3 \
+            rsync \
+            unzip \
+            zip \
+            zstd
+
+          mkdir -p "$WORKSPACE"
+
+      # ---------------------------------------------------------
+      # 8. Setup compiler
+      # ---------------------------------------------------------
+      - name: Setup toolchain
         run: |
           bash build-system/scripts/toolchain.sh
 
+      # ---------------------------------------------------------
+      # 9. Download A135F kernel source
+      # ---------------------------------------------------------
       - name: Fetch kernel source
         run: |
           bash build-system/scripts/source.sh
 
+      # ---------------------------------------------------------
+      # 10. Install KernelSU-Next Legacy
+      # ---------------------------------------------------------
       - name: Install KernelSU-Next
         run: |
           bash build-system/scripts/kernelsu.sh
 
-      - name: Apply KernelSU and SUSFS patches
+      # ---------------------------------------------------------
+      # 11. Apply manual hooks + SUSFS + path_umount
+      # ---------------------------------------------------------
+      - name: Apply KSU and SUSFS patches
         run: |
           bash build-system/scripts/patches.sh all
 
+      # ---------------------------------------------------------
+      # 12. Setup ccache
+      # ---------------------------------------------------------
+      - name: Setup ccache
+        if: env.ENABLE_CCACHE == 'true'
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: A135F-KSU-SUSFS
+          max-size: 2G
+
+      # ---------------------------------------------------------
+      # 13. Build kernel
+      # ---------------------------------------------------------
       - name: Build kernel
         run: |
           bash build-system/scripts/build.sh all
 
+      # ---------------------------------------------------------
+      # 14. Package AnyKernel3
+      # ---------------------------------------------------------
       - name: Package AnyKernel3
         run: |
-          bash build-system/scripts/package.sh anykernel3
+          bash build-system/scripts/package.sh all
 
+      # ---------------------------------------------------------
+      # 15. Upload Image.gz
+      # ---------------------------------------------------------
       - name: Upload kernel image
         uses: actions/upload-artifact@v4
         with:
-          name: A135F-Kernel-Image
+          name: A135F-KSU-Next-SUSFS-Image
           path: kernel_workspace/android-kernel/out/arch/arm64/boot/Image.gz
           if-no-files-found: error
 
+      # ---------------------------------------------------------
+      # 16. Upload flashable AnyKernel3
+      # ---------------------------------------------------------
       - name: Upload AnyKernel3
         uses: actions/upload-artifact@v4
         with:
           name: A135F-KSU-Next-SUSFS-AnyKernel3
           path: kernel_workspace/AnyKernel3/*
           if-no-files-found: error
+
+      # ---------------------------------------------------------
+      # 17. Show final files
+      # ---------------------------------------------------------
+      - name: Show build result
+        run: |
+          echo "=============================="
+          echo "BUILD COMPLETED"
+          echo "=============================="
+
+          echo ""
+          echo "Kernel:"
+          ls -lh \
+            kernel_workspace/android-kernel/out/arch/arm64/boot/Image.gz
+
+          echo ""
+          echo "AnyKernel3:"
+          ls -lh \
+            kernel_workspace/AnyKernel3/
