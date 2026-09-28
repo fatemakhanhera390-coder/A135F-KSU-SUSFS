@@ -1,65 +1,66 @@
-name: Build A135F 4.19.325 - MAX ARAF KSU-Next SUSFS
+name: A135F KernelSU-Next SUSFS MAX ARAF
 
 on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
-    name: Build 4.19.325-MAX-ARAF
+    name: Build A135F 4.19.325 KSU-Next SUSFS
     runs-on: ubuntu-24.04
 
     env:
-      ARCH: arm64
-      KERNEL_DIR: kernel
-      OUT_DIR: out
-
       KERNEL_REPO: https://github.com/Samsung-Galaxy-A13-A135F-Development/android_kernel_samsung_exynos850.git
       KERNEL_BRANCH: lineage-24.0
       DEFCONFIG: exynos850-a13nsxx_defconfig
 
-      # KernelSU-Next branch made specifically for 4.19 SUSFS
       KSU_REPO: https://github.com/SuleMareVientu/KernelSU-Next.git
       KSU_BRANCH: next-susfs-4.19
 
-      # SUSFS kernel-side sources
       SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
       SUSFS_BRANCH: kernel-4.19
 
-      CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-kernel-build-2022/clang-r450784.tar.gz
+      KERNEL_TAG: -MAX-ARAF
 
     steps:
 
       # ============================================================
       # 1. Checkout workflow
       # ============================================================
+
       - name: Checkout workflow
         uses: actions/checkout@v4
-
 
       # ============================================================
       # 2. Free disk space
       # ============================================================
-      - name: Free disk space
-        run: |
-          set -eux
 
-          sudo rm -rf /usr/local/lib/android/sdk/ndk || true
-          sudo rm -rf /usr/share/dotnet || true
-          sudo rm -rf /opt/ghc || true
-          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+      - name: Free disk space
+        shell: bash
+        run: |
+          set -euxo pipefail
 
           df -h
 
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/powershell
+
+          sudo apt-get clean
+
+          df -h
 
       # ============================================================
       # 3. Install dependencies
       # ============================================================
+
       - name: Install dependencies
+        shell: bash
         run: |
-          set -eux
+          set -euxo pipefail
 
           sudo apt-get update
 
@@ -72,6 +73,7 @@ jobs:
             flex \
             git \
             libelf-dev \
+            libncurses5-dev \
             libssl-dev \
             lz4 \
             python3 \
@@ -79,16 +81,21 @@ jobs:
             rsync \
             unzip \
             wget \
-            zip
+            zip \
+            zstd \
+            gcc \
+            g++ \
+            file
 
           git --version
           gcc --version
-          clang --version || true
-
+          python3 --version
 
       # ============================================================
       # 4. Setup Android Clang
+      # GitHub mirror instead of android.googlesource 503
       # ============================================================
+
       - name: Setup Android Clang
         shell: bash
         run: |
@@ -97,69 +104,42 @@ jobs:
           TOOLCHAIN="$HOME/android-clang"
           ARCHIVE="$RUNNER_TEMP/clang-r450784e.tar.gz"
 
+          URL="https://github.com/ravindu644/Android-Kernel-Tutorials/releases/download/toolchains/clang-r450784e.tar.gz"
+
           rm -rf "$TOOLCHAIN"
           mkdir -p "$TOOLCHAIN"
 
-          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android13-release/clang-r450784e.tar.gz"
+          echo "Downloading clang-r450784e..."
 
-          echo "Downloading official Android clang-r450784e..."
-          echo "$URL"
-
-          success=0
-
-          for i in 1 2 3 4 5 6 7 8; do
-            echo "Download attempt $i..."
-
-            rm -f "$ARCHIVE"
-
-            if curl -L \
-              --fail \
-              --connect-timeout 30 \
-              --max-time 900 \
-              --retry 3 \
-              --retry-delay 10 \
-              "$URL" \
-              -o "$ARCHIVE"; then
-
-              success=1
-              break
-            fi
-
-            echo "Attempt $i failed. Waiting..."
-            sleep 15
-          done
-
-          if [ "$success" -ne 1 ]; then
-            echo "ERROR: Unable to download Android clang-r450784e"
-            exit 1
-          fi
+          curl -fL \
+            --retry 8 \
+            --retry-delay 10 \
+            --retry-all-errors \
+            --connect-timeout 30 \
+            --max-time 1800 \
+            "$URL" \
+            -o "$ARCHIVE"
 
           test -s "$ARCHIVE"
 
           echo "Extracting clang..."
+
           tar -xzf "$ARCHIVE" -C "$TOOLCHAIN"
 
-          echo "Checking clang..."
+          echo "Searching for clang binaries..."
 
-                    test -x "$TOOLCHAIN/bin/clang"
-          test -x "$TOOLCHAIN/bin/ld.lld"
+          CLANG_BIN="$(find "$TOOLCHAIN" -type f -path '*/bin/clang' | head -n 1)"
+          LLD_BIN="$(find "$TOOLCHAIN" -type f -path '*/bin/ld.lld' | head -n 1)"
 
-          echo "LLVM_HOME=$TOOLCHAIN" >> "$GITHUB_ENV"
-          echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
+          test -n "$CLANG_BIN"
+          test -n "$LLD_BIN"
 
-          "$TOOLCHAIN/bin/clang" --version
-          "$TOOLCHAIN/bin/ld.lld" --version
+          LLVM_HOME="$(dirname "$(dirname "$CLANG_BIN")")"
 
-          echo "Android clang-r450784e ready."
+          echo "LLVM_HOME=$LLVM_HOME" >> "$GITHUB_ENV"
+          echo "$LLVM_HOME/bin" >> "$GITHUB_PATH"
 
-
-      # ============================================================
-      # 5. Verify toolchain
-      # ============================================================
-      - name: Verify toolchain
-        shell: bash
-        run: |
-          set -eux
+          chmod +x "$LLVM_HOME/bin/"* || true
 
           test -x "$LLVM_HOME/bin/clang"
           test -x "$LLVM_HOME/bin/ld.lld"
@@ -167,25 +147,47 @@ jobs:
           "$LLVM_HOME/bin/clang" --version
           "$LLVM_HOME/bin/ld.lld" --version
 
-          echo "Clang verification passed."
+          echo "Android clang-r450784e ready."
 
+      # ============================================================
+      # 5. Verify toolchain
+      # ============================================================
+
+      - name: Verify toolchain
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          test -x "$LLVM_HOME/bin/clang"
+          test -x "$LLVM_HOME/bin/ld.lld"
+
+          "$LLVM_HOME/bin/clang" --version
+          "$LLVM_HOME/bin/ld.lld" --version
+
+          command -v git
+          command -v make
+
+          echo "LLVM_HOME=$LLVM_HOME"
+          echo "Toolchain verification passed."
 
       # ============================================================
       # 6. Fetch A135F kernel
       # ============================================================
+
       - name: Fetch A135F kernel
+        shell: bash
         run: |
           set -euxo pipefail
 
-          rm -rf "$KERNEL_DIR"
+          rm -rf kernel
 
           git clone \
             --depth=1 \
             --branch "$KERNEL_BRANCH" \
             "$KERNEL_REPO" \
-            "$KERNEL_DIR"
+            kernel
 
-          cd "$KERNEL_DIR"
+          cd kernel
 
           echo "Kernel commit:"
           git log -1 --oneline
@@ -195,24 +197,22 @@ jobs:
 
           test "$(make kernelversion)" = "4.19.325"
 
-          echo "Checking defconfig..."
-          test -f "arch/arm64/configs/$DEFCONFIG"
-
-          echo "Kernel source verified."
-
-
       # ============================================================
-      # 7. Install KernelSU-Next 4.19 SUSFS branch
+      # 7. Setup KernelSU-Next 4.19 SUSFS branch
       # ============================================================
-      - name: Install KernelSU-Next 4.19 SUSFS
+
+      - name: Install KernelSU-Next
+        working-directory: kernel
+        shell: bash
         run: |
           set -euxo pipefail
 
-          cd "$KERNEL_DIR"
-
           rm -rf KernelSU-Next
+          rm -rf drivers/kernelsu
 
-          echo "Cloning KernelSU-Next..."
+          echo "Installing KernelSU-Next:"
+          echo "$KSU_BRANCH"
+
           git clone \
             --depth=1 \
             --branch "$KSU_BRANCH" \
@@ -220,150 +220,168 @@ jobs:
             KernelSU-Next
 
           test -d KernelSU-Next/kernel
+          test -f KernelSU-Next/kernel/Kconfig
+          test -f KernelSU-Next/kernel/Kbuild
+
+          ln -sfn "$(pwd)/KernelSU-Next/kernel" drivers/kernelsu
 
           echo "KernelSU-Next commit:"
           git -C KernelSU-Next log -1 --oneline
 
-          echo "Running KernelSU-Next setup..."
-
-          cd KernelSU-Next
-
-          chmod +x kernel/setup.sh
-
-          ./kernel/setup.sh legacy
-
-          cd ..
-
-          test -L drivers/kernelsu
-          test -d drivers/kernelsu
-
-          echo "KernelSU-Next installed."
-
-          echo "Checking SUSFS Kconfig..."
-
-          grep -R "CONFIG_KSU_SUSFS" \
-            drivers/kernelsu \
-            | head -30 || true
-
+          echo "KernelSU kernel directory:"
+          ls -la KernelSU-Next/kernel | head
 
       # ============================================================
-      # 8. Install SUSFS kernel-side 4.19
+      # 8. Install SUSFS kernel-side sources
       # ============================================================
-      - name: Install SUSFS kernel-side 4.19
+
+      - name: Install SUSFS kernel sources
+        working-directory: kernel
+        shell: bash
         run: |
           set -euxo pipefail
 
-          cd "$KERNEL_DIR"
-
           rm -rf susfs4ksu
 
-          echo "Cloning SUSFS kernel-4.19..."
+          echo "Cloning SUSFS:"
+          echo "$SUSFS_BRANCH"
+
           git clone \
             --depth=1 \
             --branch "$SUSFS_BRANCH" \
             "$SUSFS_REPO" \
             susfs4ksu
 
-          echo "SUSFS commit:"
-          git -C susfs4ksu log -1 --oneline
-
-          echo "Checking SUSFS files..."
-
           test -f susfs4ksu/kernel_patches/fs/susfs.c
           test -f susfs4ksu/kernel_patches/include/linux/susfs.h
           test -f susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch
+          test -f susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
 
-          echo "Copying SUSFS kernel files..."
+          echo "Copying SUSFS filesystem sources..."
 
           cp -fv \
             susfs4ksu/kernel_patches/fs/* \
             fs/
 
+          echo "Copying SUSFS headers..."
+
           cp -fv \
             susfs4ksu/kernel_patches/include/linux/* \
             include/linux/
 
-          echo "Checking susfs.h BEFORE patch..."
-
+          test -f fs/susfs.c
           test -f include/linux/susfs.h
 
-          ls -lh include/linux/susfs.h
-          ls -lh fs/susfs.c
+          echo "SUSFS kernel files installed."
 
-          echo "Applying SUSFS 4.19 kernel patch..."
+      # ============================================================
+      # 9. Apply SUSFS patch to KernelSU-Next
+      # ============================================================
 
-          patch -p1 \
+      - name: Patch KernelSU-Next for SUSFS
+        working-directory: kernel
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "Applying KernelSU SUSFS integration patch..."
+
+          patch \
+            -d KernelSU-Next \
+            -p1 \
+            --forward \
+            --verbose \
+            < susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
+
+          echo "KernelSU SUSFS patch applied."
+
+          test -f KernelSU-Next/kernel/Kconfig
+
+          grep -q "config KSU_SUSFS" \
+            KernelSU-Next/kernel/Kconfig
+
+          echo "KSU SUSFS config detected."
+
+      # ============================================================
+      # 10. Apply SUSFS kernel 4.19 patch
+      # ============================================================
+
+      - name: Patch kernel for SUSFS
+        working-directory: kernel
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "Applying SUSFS kernel-4.19 patch..."
+
+          patch \
+            -p1 \
+            --forward \
+            --verbose \
             < susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch
 
           echo "SUSFS kernel patch applied."
 
-          echo "Final SUSFS files:"
-          test -f include/linux/susfs.h
           test -f fs/susfs.c
-
-          echo "SUSFS kernel-side integration verified."
-
+          test -f include/linux/susfs.h
 
       # ============================================================
-      # 9. Apply manual hooks for non-GKI 4.19
+      # 11. Apply manual syscall hooks
       # ============================================================
-      - name: Apply KernelSU manual hooks
+
+      - name: Apply A135F 4.19 manual hooks
+        working-directory: kernel
+        shell: bash
         run: |
           set -euxo pipefail
 
-          cd "$KERNEL_DIR"
+          echo "Applying manual syscall hooks..."
 
-          echo "Applying manual hooks..."
+          curl -fL \
+            --retry 5 \
+            --retry-delay 5 \
+            --retry-all-errors \
+            "https://raw.githubusercontent.com/Iam-nishan/Jujutsu-kernel/V6/syscall_hook.sh" \
+            -o /tmp/syscall_hook.sh
 
-          curl -L --fail \
-            https://raw.githubusercontent.com/Iam-nishan/Jujutsu-kernel/V6/syscall_hook.sh \
-            -o syscall_hook.sh
+          chmod +x /tmp/syscall_hook.sh
 
-          chmod +x syscall_hook.sh
+          bash /tmp/syscall_hook.sh
 
-          bash syscall_hook.sh
-
-          echo "Manual hooks applied."
-
-          echo "Checking patched kernel files..."
-
-          grep -R "CONFIG_KSU_MANUAL_HOOK" \
-            fs kernel \
-            2>/dev/null | head -20 || true
-
+          echo "Manual hooks completed."
 
       # ============================================================
-      # 10. Prepare build directory
+      # 12. Prepare output
       # ============================================================
+
       - name: Prepare build directory
-        run: |
-          set -eux
-
-          cd "$KERNEL_DIR"
-
-          rm -rf "$OUT_DIR"
-          mkdir -p "$OUT_DIR"
-
-          echo "Build directory ready."
-
-
-      # ============================================================
-      # 11. Configure A135F kernel
-      # ============================================================
-      - name: Configure A135F kernel
+        working-directory: kernel
+        shell: bash
         run: |
           set -euxo pipefail
 
-          cd "$KERNEL_DIR"
+          rm -rf out
+          mkdir -p out
+
+      # ============================================================
+      # 13. Configure kernel
+      # ============================================================
+
+      - name: Configure A135F kernel
+        working-directory: kernel
+        shell: bash
+        run: |
+          set -euxo pipefail
 
           make \
-            O="$OUT_DIR" \
-            ARCH="$ARCH" \
+            O=out \
+            ARCH=arm64 \
             "$DEFCONFIG"
 
-          echo "Applying KernelSU/SUSFS config..."
-
-          ./scripts/config --file "$OUT_DIR/.config" \
+          ./scripts/config --file out/.config \
+            --enable CONFIG_KPROBES \
+            --enable CONFIG_HAVE_KPROBES \
+            --enable CONFIG_KPROBE_EVENTS \
             --enable CONFIG_KSU \
             --enable CONFIG_KSU_MANUAL_HOOK \
             --enable CONFIG_KSU_SUSFS \
@@ -371,126 +389,149 @@ jobs:
             --enable CONFIG_KSU_SUSFS_SUS_PATH \
             --enable CONFIG_KSU_SUSFS_SUS_MOUNT \
             --enable CONFIG_KSU_SUSFS_SUS_KSTAT \
+            --enable CONFIG_KSU_SUSFS_TRY_UMOUNT \
             --enable CONFIG_KSU_SUSFS_SPOOF_UNAME \
+            --enable CONFIG_KSU_SUSFS_ENABLE_LOG \
+            --enable CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+            --enable CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
             --enable CONFIG_KSU_SUSFS_OPEN_REDIRECT \
-            --enable CONFIG_KPROBES \
-            --enable CONFIG_HAVE_KPROBES \
-            --enable CONFIG_KPROBE_EVENTS \
             --enable CONFIG_OVERLAY_FS \
-            --disable CONFIG_LTO \
             --disable CONFIG_LTO_CLANG \
-            --disable CONFIG_WERROR \
-            --set-str CONFIG_LOCALVERSION "-MAX-ARAF"
+            --disable CONFIG_THINLTO \
+            --disable CONFIG_LTO_NONE
+
+          ./scripts/config --file out/.config \
+            --set-str CONFIG_LOCALVERSION "$KERNEL_TAG"
 
           make \
-            O="$OUT_DIR" \
-            ARCH="$ARCH" \
+            O=out \
+            ARCH=arm64 \
             olddefconfig
 
-          echo "Kernel configuration completed."
-
-
-      # ============================================================
-      # 12. Verify KSU + SUSFS before build
-      # ============================================================
-      - name: Verify KSU SUSFS integration
-        run: |
-          set -euxo pipefail
-
-          cd "$KERNEL_DIR"
-
-          echo "========== CONFIG =========="
+          echo
+          echo "===== IMPORTANT CONFIG ====="
 
           grep -E \
-            'CONFIG_KSU=|CONFIG_KSU_MANUAL_HOOK=|CONFIG_KSU_SUSFS=|CONFIG_KSU_SUSFS_' \
-            "$OUT_DIR/.config" \
-            | head -100
-
-          echo "========== SUSFS HEADER =========="
-
-          test -f include/linux/susfs.h
-
-          grep -n "susfs" \
-            include/linux/susfs.h \
-            | head -20 || true
-
-          echo "========== SUSFS SOURCE =========="
-
-          test -f fs/susfs.c
-
-          echo "========== KSU SOURCE =========="
-
-          test -d drivers/kernelsu
-          test -f drivers/kernelsu/Kconfig
-
-          echo "========== HEADER COMPILE TEST =========="
-
-          grep -n 'linux/susfs.h' \
-            drivers/kernelsu/su.c \
-            drivers/kernelsu/ksu.c \
-            2>/dev/null || true
-
-          echo "KSU + SUSFS integration verified before compilation."
-
+            'CONFIG_KSU=|CONFIG_KSU_SUSFS=|CONFIG_KSU_MANUAL_HOOK=|CONFIG_KPROBES=|CONFIG_KPROBE_EVENTS=|CONFIG_LOCALVERSION=' \
+            out/.config || true
 
       # ============================================================
-      # 13. Build kernel
+      # 14. Verify SUSFS integration before build
       # ============================================================
-      - name: Build kernel
+
+      - name: Verify KernelSU SUSFS integration
+        working-directory: kernel
+        shell: bash
         run: |
           set -euxo pipefail
 
-          cd "$KERNEL_DIR"
+          echo "Checking SUSFS files..."
+
+          test -f fs/susfs.c
+          test -f include/linux/susfs.h
+
+          echo "Checking KernelSU SUSFS config..."
+
+          grep -q 'CONFIG_KSU=y' out/.config
+          grep -q 'CONFIG_KSU_SUSFS=y' out/.config
+
+          echo "Checking KernelSU source..."
+
+          test -f KernelSU-Next/kernel/Kconfig
+          test -f KernelSU-Next/kernel/Kbuild
+
+          grep -q 'KSU_SUSFS' KernelSU-Next/kernel/Kconfig
+
+          echo "Checking SUSFS version..."
+
+          grep -E \
+            '^#define SUSFS_VERSION' \
+            include/linux/susfs.h || true
+
+          echo
+          echo "======================================"
+          echo "KernelSU-Next + SUSFS integration OK"
+          echo "======================================"
+
+      # ============================================================
+      # 15. Build kernel
+      # ============================================================
+
+      - name: Build kernel
+        working-directory: kernel
+        shell: bash
+        run: |
+          set -euxo pipefail
 
           export PATH="$LLVM_HOME/bin:$PATH"
 
-          echo "Compiler:"
-          clang --version
+          export ARCH=arm64
+          export LLVM=1
+          export LLVM_IAS=1
 
-          echo "Building kernel..."
+          export CC="$LLVM_HOME/bin/clang"
+          export LD="$LLVM_HOME/bin/ld.lld"
+
+          export AR="$LLVM_HOME/bin/llvm-ar"
+          export NM="$LLVM_HOME/bin/llvm-nm"
+          export OBJCOPY="$LLVM_HOME/bin/llvm-objcopy"
+          export OBJDUMP="$LLVM_HOME/bin/llvm-objdump"
+          export STRIP="$LLVM_HOME/bin/llvm-strip"
+          export READELF="$LLVM_HOME/bin/llvm-readelf"
+          export OBJSIZE="$LLVM_HOME/bin/llvm-size"
+
+          export HOSTCC=/usr/bin/gcc
+          export HOSTCXX=/usr/bin/g++
+
+          echo "Compiler:"
+          "$CC" --version
+
+          echo
+          echo "Starting kernel build..."
 
           make \
-            O="$OUT_DIR" \
-            ARCH="$ARCH" \
+            O=out \
+            ARCH=arm64 \
             LLVM=1 \
             LLVM_IAS=1 \
-            CC=clang \
-            LD=ld.lld \
-            AR=llvm-ar \
-            NM=llvm-nm \
-            OBJCOPY=llvm-objcopy \
-            OBJDUMP=llvm-objdump \
-            STRIP=llvm-strip \
-            HOSTCC=gcc \
-            HOSTCXX=g++ \
-            KCFLAGS="-Wno-error=strict-prototypes" \
-            -j"$(nproc)"
-
-          echo "Kernel build completed."
-
+            CC="$CC" \
+            LD="$LD" \
+            HOSTCC="$HOSTCC" \
+            HOSTCXX="$HOSTCXX" \
+            -j2
 
       # ============================================================
-      # 14. Verify kernel image
+      # 16. Verify kernel output
       # ============================================================
-      - name: Verify kernel image
+
+      - name: Verify kernel output
+        working-directory: kernel
+        shell: bash
         run: |
-          set -eux
+          set -euxo pipefail
 
-          cd "$KERNEL_DIR"
+          echo "Checking kernel output..."
 
-          IMAGE="arch/arm64/boot/Image.gz"
+          find out/arch/arm64/boot \
+            -maxdepth 2 \
+            -type f \
+            -printf '%p\n' || true
 
-          test -f "$IMAGE"
+          test -f out/arch/arm64/boot/Image.gz
 
-          ls -lh "$IMAGE"
+          echo
+          echo "Kernel build successful."
 
-          echo "Kernel Image.gz successfully built."
+          ls -lh out/arch/arm64/boot/Image.gz
 
+          file out/arch/arm64/boot/Image.gz
 
       # ============================================================
-      # 15. Prepare AnyKernel3
+      # 17. Download AnyKernel3
       # ============================================================
+
       - name: Prepare AnyKernel3
+        shell: bash
         run: |
           set -euxo pipefail
 
@@ -501,14 +542,25 @@ jobs:
             https://github.com/osm0sis/AnyKernel3.git \
             AnyKernel3
 
+          rm -rf AnyKernel3/.git
+
           cp \
-            "$KERNEL_DIR/arch/arm64/boot/Image.gz" \
-            AnyKernel3/Image.gz
+            kernel/out/arch/arm64/boot/Image.gz \
+            AnyKernel3/
+
+      # ============================================================
+      # 18. Configure AnyKernel3
+      # ============================================================
+
+      - name: Configure AnyKernel3
+        shell: bash
+        run: |
+          set -euxo pipefail
 
           cd AnyKernel3
 
           sed -i \
-            's/^kernel.string=.*/kernel.string=A135F 4.19.325 MAX ARAF KernelSU-Next SUSFS/' \
+            's/^kernel.string=.*/kernel.string=A135F KernelSU-Next SUSFS MAX ARAF/' \
             anykernel.sh
 
           sed -i \
@@ -516,27 +568,72 @@ jobs:
             anykernel.sh
 
           sed -i \
-            's/^device.name2=.*/device.name2=a13/' \
+            's/^device.name2=.*/device.name2=SM-A135F\/DS/' \
             anykernel.sh
 
-          echo "AnyKernel3 prepared."
-
+          echo
+          echo "AnyKernel3 configuration:"
           grep -E \
             'kernel.string|device.name' \
             anykernel.sh || true
 
+      # ============================================================
+      # 19. Package kernel
+      # ============================================================
 
-      # ============================================================
-      # 16. Package flashable ZIP
-      # ============================================================
       - name: Package kernel ZIP
+        shell: bash
         run: |
-          set -eux
+          set -euxo pipefail
 
           cd AnyKernel3
 
-          rm -rf .git
-          rm -f README.md
-          rm -f LICENSE
+          zip -r9 \
+            "../A135F-KSU-Next-SUSFS-MAX-ARAF.zip" \
+            . \
+            -x "*.git*" \
+            -x "README.md"
 
-          ZIP_NAME="A135F-4.19.325-MAX-ARAF-KSU-Next
+          cd ..
+
+          ls -lh \
+            A135F-KSU-Next-SUSFS-MAX-ARAF.zip \
+            AnyKernel3/Image.gz
+
+      # ============================================================
+      # 20. Upload artifacts
+      # ============================================================
+
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: A135F-KSU-Next-SUSFS-MAX-ARAF
+          path: |
+            A135F-KSU-Next-SUSFS-MAX-ARAF.zip
+            AnyKernel3/Image.gz
+            kernel/out/arch/arm64/boot/Image.gz
+          if-no-files-found: error
+          retention-days: 14
+
+      # ============================================================
+      # 21. Final summary
+      # ============================================================
+
+      - name: Build summary
+        shell: bash
+        run: |
+          echo "=============================================="
+          echo " A135F KernelSU-Next + SUSFS BUILD COMPLETE"
+          echo "=============================================="
+          echo
+          echo "Device       : SM-A135F/DS"
+          echo "Kernel       : 4.19.325"
+          echo "KSU          : KernelSU-Next"
+          echo "SUSFS        : kernel-4.19"
+          echo "Kernel tag   : MAX-ARAF"
+          echo "Architecture : arm64"
+          echo
+          echo "Artifacts:"
+          ls -lh \
+            A135F-KSU-Next-SUSFS-MAX-ARAF.zip \
+            AnyKernel3/Image.gz
