@@ -236,7 +236,7 @@ jobs:
 
           test -d KernelSU-Next/kernel
           test -f KernelSU-Next/kernel/Kconfig
-          test -f KernelSU-Next/kernel/Kbuild
+          test -f KernelSU-Next/kernel/Makefile
 
           ln -sfn "$(pwd)/KernelSU-Next/kernel" drivers/kernelsu
 
