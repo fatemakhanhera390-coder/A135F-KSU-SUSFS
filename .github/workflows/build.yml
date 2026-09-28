@@ -43,15 +43,31 @@ jobs:
             gcc-aarch64-linux-gnu
 
       - name: Fetch A135F kernel
+        uses: actions/checkout@v4
+        with:
+          repository: Samsung-Galaxy-A13-A135F-Development/android_kernel_exynos850
+          ref: lineage-24.0
+          path: kernel
+          fetch-depth: 1
+
+      - name: Verify A135F kernel
         shell: bash
         run: |
           set -euxo pipefail
-          rm -rf kernel
-          git clone --depth=1 --branch "$KERNEL_BRANCH" "$KERNEL_REPO" kernel
+
           cd kernel
-          test "$(make kernelversion)" = "$KERNEL_VERSION_EXPECTED"
-          test -f "arch/arm64/configs/$KERNEL_DEFCONFIG"
+
+          echo "Kernel commit:"
           git log -1 --oneline
+
+          echo "Kernel version:"
+          make kernelversion
+
+          test "$(make kernelversion)" = "4.19.325"
+
+          test -f "arch/arm64/configs/exynos850-a13nsxx_defconfig"
+
+          echo "A135F kernel fetched successfully."
 
       - name: Install Clang toolchain
         shell: bash
