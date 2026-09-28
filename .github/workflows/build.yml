@@ -109,7 +109,7 @@ jobs:
           rm -rf "$TOOLCHAIN"
           mkdir -p "$TOOLCHAIN"
 
-          echo "Downloading clang-r450784e..."
+          echo "Downloading Android clang-r450784e..."
 
           curl -fL \
             --retry 8 \
@@ -126,27 +126,42 @@ jobs:
 
           tar -xzf "$ARCHIVE" -C "$TOOLCHAIN"
 
-          echo "Searching for clang binaries..."
+          echo "Checking Android Clang..."
 
-          CLANG_BIN="$(find "$TOOLCHAIN" -type f -path '*/bin/clang' | head -n 1)"
-          LLD_BIN="$(find "$TOOLCHAIN" -type f -path '*/bin/ld.lld' | head -n 1)"
+          # IMPORTANT:
+          # ld.lld is a symlink to lld in Android Clang.
+          # Do NOT use find -type f here.
 
-          test -n "$CLANG_BIN"
-          test -n "$LLD_BIN"
+          test -x "$TOOLCHAIN/bin/clang"
+          test -e "$TOOLCHAIN/bin/ld.lld"
+          test -x "$TOOLCHAIN/bin/ld.lld"
 
-          LLVM_HOME="$(dirname "$(dirname "$CLANG_BIN")")"
+          test -x "$TOOLCHAIN/bin/lld"
+          test -x "$TOOLCHAIN/bin/llvm-ar"
+          test -x "$TOOLCHAIN/bin/llvm-nm"
+          test -x "$TOOLCHAIN/bin/llvm-objcopy"
+          test -x "$TOOLCHAIN/bin/llvm-objdump"
+          test -x "$TOOLCHAIN/bin/llvm-strip"
+          test -x "$TOOLCHAIN/bin/llvm-readelf"
+          test -x "$TOOLCHAIN/bin/llvm-size"
 
-          echo "LLVM_HOME=$LLVM_HOME" >> "$GITHUB_ENV"
-          echo "$LLVM_HOME/bin" >> "$GITHUB_PATH"
+          echo "LLVM_HOME=$TOOLCHAIN" >> "$GITHUB_ENV"
+          echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
 
-          chmod +x "$LLVM_HOME/bin/"* || true
+          echo
+          echo "===== CLANG ====="
+          "$TOOLCHAIN/bin/clang" --version
 
-          test -x "$LLVM_HOME/bin/clang"
-          test -x "$LLVM_HOME/bin/ld.lld"
+          echo
+          echo "===== LLD ====="
+          "$TOOLCHAIN/bin/ld.lld" --version
 
-          "$LLVM_HOME/bin/clang" --version
-          "$LLVM_HOME/bin/ld.lld" --version
+          echo
+          echo "===== LLVM TOOLS ====="
+          "$TOOLCHAIN/bin/llvm-ar" --version | head -n 1
+          "$TOOLCHAIN/bin/llvm-nm" --version | head -n 1
 
+          echo
           echo "Android clang-r450784e ready."
 
       # ============================================================
