@@ -260,7 +260,32 @@ jobs:
           find . -type f \( -name '*.rej' -o -name '*.orig' \) -not -path './.git/*' -delete || true
 
           # First pass: modest context drift is okay; large/ambiguous drift is not.
-          patch --batch --forward -F3 -p1 --exclude=fs/namespace.c < "$PATCH_FILE" || true
+          python3 - "$PATCH_FILE" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          patch_path = Path(sys.argv[1])
+          raw = patch_path.read_text()
+
+          # GNU patch does not support --exclude=... . Build a temporary
+          # patch with only the fs/namespace.c diff removed; namespace.c
+          # is adapted structurally below.
+          parts = re.split(r'(?m)^diff --git ', raw)
+          kept = []
+          for part in parts:
+              if not part.strip():
+                  continue
+              if re.search(r'(?m)^a/fs/namespace\.c\s+b/fs/namespace\.c$', part):
+                  continue
+              kept.append("diff --git " + part)
+
+          Path("/tmp/susfs-no-namespace.patch").write_text(
+              "".join(kept)
+          )
+          PY
+
+          patch --batch --forward -F3 -p1 < /tmp/susfs-no-namespace.patch || true
 
           cat > /tmp/repair_susfs_rejects.py <<'PY'
           import difflib
@@ -448,55 +473,84 @@ jobs:
 
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           path = Path("fs/namespace.c")
           src = path.read_text()
 
-          def function_body(text, signature):
-              start = text.find(signature)
-              if start < 0:
-                  raise SystemExit(f"Function not found: {signature}")
+          def function_body(text, name):
+              # Find the actual C function definition, not a call/prototype.
+              for m in re.finditer(r"\b" + re.escape(name) + r"\s*\(", text):
+                  pos = m.end() - 1
+                  depth = 0
+                  i = pos
 
-              brace = text.find("{", start)
-              if brace < 0:
-                  raise SystemExit(f"Opening brace not found: {signature}")
+                  while i < len(text):
+                      if text[i] == "(":
+                          depth += 1
+                      elif text[i] == ")":
+                          depth -= 1
+                          if depth == 0:
+                              break
+                      i += 1
 
-              depth = 0
+                  if i >= len(text):
+                      continue
 
-              for i in range(brace, len(text)):
-                  if text[i] == "{":
-                      depth += 1
-                  elif text[i] == "}":
-                      depth -= 1
-                      if depth == 0:
-                          return start, i + 1, text[start:i + 1]
+                  j = i + 1
+                  while j < len(text) and text[j].isspace():
+                      j += 1
 
-              raise SystemExit(f"Unbalanced braces: {signature}")
+                  # A real definition has an opening brace after the
+                  # argument list; calls/prototypes do not.
+                  if j >= len(text) or text[j] != "{":
+                      continue
 
-          def insert_once_in_function(
-              text, signature, needle, block, label
-          ):
-              start, end, body = function_body(text, signature)
+                  brace = j
+                  depth = 0
+                  for k in range(brace, len(text)):
+                      if text[k] == "{":
+                          depth += 1
+                      elif text[k] == "}":
+                          depth -= 1
+                          if depth == 0:
+                              return m.start(), k + 1, text[m.start():k + 1]
 
-              count = body.count(needle)
+              raise SystemExit(f"Function definition not found: {name}")
 
-              if count != 1:
-                  raise SystemExit(
-                      f"{label}: expected exactly one anchor "
-                      f"{needle!r}, found {count}"
-                  )
+          def insert_after_anchor(text, name, anchors, block, label):
+              start, end, body = function_body(text, name)
 
               if block.strip() in body:
                   return text
 
-              pos = body.find(needle) + len(needle)
+              for needle in anchors:
+                  if body.count(needle) == 1:
+                      pos = body.find(needle) + len(needle)
+                      new_body = body[:pos] + block + body[pos:]
+                      return text[:start] + new_body + text[end:]
 
-              new_body = body[:pos] + block + body[pos:]
+              # Whitespace-tolerant fallback for the same C statement.
+              for needle in anchors:
+                  if needle in (
+                      "mnt->mnt_parent = mnt;",
+                      "mnt->mnt.mnt_parent = mnt;",
+                  ):
+                      pat = re.compile(
+                          r"mnt\s*->\s*mnt_parent\s*=\s*mnt\s*;"
+                      )
+                      matches = list(pat.finditer(body))
+                      if len(matches) == 1:
+                          pos = matches[0].end()
+                          new_body = body[:pos] + block + body[pos:]
+                          return text[:start] + new_body + text[end:]
 
-              return text[:start] + new_body + text[end:]
+              raise SystemExit(
+                  f"{label}: none of the expected anchors were found: "
+                  + ", ".join(repr(x) for x in anchors)
+              )
 
           vfs_block = r'''
-
           #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
               /* SUSFS: reorder mounts created by zygote. */
               if (likely(current->android_kabi_reserved3 & 1)) {
@@ -507,7 +561,6 @@ jobs:
           '''
 
           clone_block = r'''
-
           #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
               /* SUSFS: reorder mounts created by zygote. */
               if (likely(current->android_kabi_reserved3 & 1)) {
@@ -525,7 +578,6 @@ jobs:
           '''
 
           copy_block = r'''
-
           #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
               /*
                * Assign fake mount ids to the namespace copied from zygote.
@@ -571,41 +623,43 @@ jobs:
           #endif
           '''
 
-          src = insert_once_in_function(
+          src = insert_after_anchor(
               src,
-              "vfs_kern_mount(",
-              "mnt->mnt_parent = mnt;",
+              "vfs_kern_mount",
+              (
+                  "mnt->mnt_parent = mnt;",
+                  "mnt->mnt.mnt_parent = mnt;",
+              ),
               vfs_block,
-              "vfs_kern_mount"
+              "vfs_kern_mount",
           )
 
-          src = insert_once_in_function(
+          src = insert_after_anchor(
               src,
-              "clone_mnt(",
-              "mnt->mnt_parent = mnt;",
+              "clone_mnt",
+              (
+                  "mnt->mnt_parent = mnt;",
+                  "mnt->mnt.mnt_parent = mnt;",
+              ),
               clone_block,
-              "clone_mnt"
+              "clone_mnt",
           )
 
           # Insert the namespace fake-id pass immediately before the
           # namespace unlock at the end of copy_mnt_ns().
-          start, end, body = function_body(
-              src, "struct mnt_namespace *copy_mnt_ns("
-          )
+          start, end, body = function_body(src, "copy_mnt_ns")
 
           if "CONFIG_KSU_SUSFS_SUS_MOUNT" not in body:
               needle = "namespace_unlock();"
 
               if body.count(needle) != 1:
                   raise SystemExit(
-                      "copy_mnt_ns: expected exactly one "
-                      f"namespace_unlock(), found {body.count(needle)}"
+                      "copy_mnt_ns: expected exactly one namespace_unlock(), "
+                      f"found {body.count(needle)}"
                   )
 
               pos = body.find(needle)
-
               body = body[:pos] + copy_block + "\n" + body[pos:]
-
               src = src[:start] + body + src[end:]
 
           path.write_text(src)
