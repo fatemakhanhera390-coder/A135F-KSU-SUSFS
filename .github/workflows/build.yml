@@ -247,6 +247,9 @@ jobs:
       #   3) abort on an ambiguous/unmatched hunk;
       #   4) never use --force and never silently ignore .rej files.
       # ============================================================
+      # ============================================================
+      # 9. ADAPT SUSFS 4.19 PATCH TO A135F
+      # ============================================================
       - name: Adapt SUSFS patch to A135F 4.19.325
         shell: bash
         working-directory: kernel
@@ -259,193 +262,145 @@ jobs:
           rm -f -- ./*.rej ./*.orig
           find . -type f \( -name '*.rej' -o -name '*.orig' \) -not -path './.git/*' -delete || true
 
-          # First pass: modest context drift is okay; large/ambiguous drift is not.
+          # The SUSFS 4.19 donor patch is based on a different 4.19 tree.
+          # A135F's namespace.c uses Samsung's 3-argument alloc_vfsmnt().
+          # First apply every compatible hunk, then repair ONLY the two
+          # namespace call-sites that differ structurally on A135F.
           patch --batch --forward -F3 -p1 < "$PATCH_FILE" || true
 
-          cat > /tmp/repair_susfs_rejects.py <<'PY'
-          import difflib
-          import pathlib
+          python3 - <<'PY'
+          from pathlib import Path
           import re
-          import sys
 
-          ROOT = pathlib.Path('.')
-          HUNK_RE = re.compile(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@')
+          p = Path("fs/namespace.c")
+          s = p.read_text()
 
-          def norm(s: str) -> str:
-              return s.rstrip('\n').rstrip()
+          if "susfs_is_current_ksu_domain()" not in s:
+              raise SystemExit("ERROR: expected SUSFS namespace integration is missing")
 
-          def find_all(seq, needle):
-              if not needle or len(needle) > len(seq):
-                  return []
-              out = []
-              n = len(needle)
-              for i in range(0, len(seq) - n + 1):
-                  if seq[i:i+n] == needle:
-                      out.append(i)
-              return out
+          # ------------------------------------------------------------
+          # A135F-specific repair #1: vfs_kern_mount()
+          # ------------------------------------------------------------
+          vfs_pos = s.find("vfs_kern_mount(")
+          clone_pos = s.find("static struct mount *clone_mnt(", vfs_pos)
+          if vfs_pos < 0 or clone_pos < 0:
+              raise SystemExit("ERROR: could not locate vfs_kern_mount()/clone_mnt()")
 
-          def longest_context_run(body):
-              best = []
-              cur = []
-              for line in body:
-                  if line.startswith(' '):
-                      cur.append(line[1:])
-                  else:
-                      if len(cur) > len(best):
-                          best = cur
-                      cur = []
-              if len(cur) > len(best):
-                  best = cur
-              return best
+          vfs = s[vfs_pos:clone_pos]
 
-          def parse_reject(path):
-              raw = path.read_text(errors='replace').splitlines(True)
-              hunks = []
-              current = None
-              for line in raw:
-                  m = HUNK_RE.match(line)
-                  if m:
-                      if current is not None:
-                          hunks.append(current)
-                      current = {'header': m.group(0), 'old_start': int(m.group(1)), 'body': []}
-                  elif current is not None:
-                      if line.startswith((' ', '+', '-')):
-                          current['body'].append(line)
-              if current is not None:
-                  hunks.append(current)
-              return hunks
+          if "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT" not in vfs:
+              m = re.search(
+                  r'(?m)^(?P<indent>[ \t]*)mnt[ \t]*=[ \t]*alloc_vfsmnt\(name(?P<args>(?:,[^;]*)?)\);[ \t]*$',
+                  vfs,
+              )
+              if not m:
+                  raise SystemExit("ERROR: A135F vfs_kern_mount alloc_vfsmnt(name...) call not found")
 
-          def apply_hunk(lines, hunk, relpath):
-              body = hunk['body']
-              old_block = [x[1:] for x in body if x.startswith((' ', '-'))]
-              new_block = [x[1:] for x in body if x.startswith((' ', '+'))]
-              removed = any(x.startswith('-') for x in body)
+              indent = m.group("indent")
+              original = m.group(0).strip()
 
-              # Exact old-block match is always preferred.
-              exact = find_all(lines, old_block)
-              if len(exact) == 1:
-                  pos = exact[0]
-                  return lines[:pos] + new_block + lines[pos+len(old_block):]
-              if len(exact) > 1:
-                  raise RuntimeError(f'ambiguous exact match in {relpath}: {hunk["header"]}')
+              block = (
+                  f"{indent}#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+                  f"{indent}if (unlikely(susfs_is_current_ksu_domain())) {{\n"
+                  f"{indent}\tmnt = alloc_vfsmnt(name, true, 0);\n"
+                  f"{indent}\tgoto bypass_orig_flow;\n"
+                  f"{indent}}}\n"
+                  f"{indent}mnt = alloc_vfsmnt(name, false, 0);\n"
+                  f"{indent}bypass_orig_flow:\n"
+                  f"{indent}#else\n"
+                  f"{indent}{original}\n"
+                  f"{indent}#endif"
+              )
+              vfs = vfs[:m.start()] + block + vfs[m.end():]
+              s = s[:vfs_pos] + vfs + s[clone_pos:]
+              clone_pos = s.find("static struct mount *clone_mnt(", vfs_pos)
+              print("Repaired A135F vfs_kern_mount()")
+          else:
+              print("vfs_kern_mount() SUSFS block already present")
 
-              if not removed:
-                  # Pure insertion hunk: locate the unchanged context and
-                  # preserve the insertion position from the donor hunk.
-                  anchor = longest_context_run(body)
-                  matches = find_all(lines, anchor)
-                  if len(matches) != 1:
-                      raise RuntimeError(f'cannot uniquely locate insertion hunk in {relpath}: {hunk["header"]}')
+          # ------------------------------------------------------------
+          # A135F-specific repair #2: clone_mnt()
+          # ------------------------------------------------------------
+          clone_pos = s.find("static struct mount *clone_mnt(")
+          next_fn = s.find("\nstatic ", clone_pos + 1)
+          if next_fn < 0:
+              next_fn = len(s)
+          clone = s[clone_pos:next_fn]
 
-                  anchor_hit = matches[0]
-                  old_anchor_offset = None
-                  for i in range(len(old_block) - len(anchor) + 1):
-                      if old_block[i:i+len(anchor)] == anchor:
-                          old_anchor_offset = i
-                          break
-                  if old_anchor_offset is None:
-                      raise RuntimeError(f'internal insertion-anchor mismatch in {relpath}: {hunk["header"]}')
+          if "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT" not in clone:
+              m = re.search(
+                  r'(?m)^(?P<indent>[ \t]*)mnt[ \t]*=[ \t]*alloc_vfsmnt\(old->mnt_devname(?P<args>(?:,[^;]*)?)\);[ \t]*$',
+                  clone,
+              )
+              if not m:
+                  raise SystemExit("ERROR: A135F clone_mnt alloc_vfsmnt(old->mnt_devname...) call not found")
 
-                  add_before = 0
-                  seen_add = False
-                  for line in body:
-                      if line.startswith('+'):
-                          seen_add = True
-                          break
-                      if line.startswith(' '):
-                          add_before += 1
-                  pos = anchor_hit - old_anchor_offset + add_before
-                  additions = [line[1:] for line in body if line.startswith('+')]
-                  return lines[:pos] + additions + lines[pos:]
+              indent = m.group("indent")
+              original = m.group(0).strip()
 
-              # For a changed hunk, locate a unique long context run and score
-              # the surrounding candidate against the donor old block.
-              anchor = longest_context_run(body)
-              if len(anchor) < 2:
-                  raise RuntimeError(f'insufficient stable context in {relpath}: {hunk["header"]}')
+              block = (
+                  f"{indent}#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+                  f"{indent}bool is_current_ksu_domain = susfs_is_current_ksu_domain();\n"
+                  f"{indent}bool is_current_zygote_domain = susfs_is_current_zygote_domain();\n\n"
+                  f"{indent}/*\n"
+                  f"{indent} * KSU/zygote SUSFS mount-id handling. CL_COPY_MNT_NS\n"
+                  f"{indent} * distinguishes an unshare/copy-tree operation from a single clone.\n"
+                  f"{indent} */\n"
+                  f"{indent}if (unlikely(is_current_ksu_domain)) {{\n"
+                  f"{indent}\tif (!(flag & CL_COPY_MNT_NS)) {{\n"
+                  f"{indent}\t\tmnt = alloc_vfsmnt(old->mnt_devname, true, 0);\n"
+                  f"{indent}\t\tgoto bypass_orig_flow;\n"
+                  f"{indent}\t}}\n"
+                  f"{indent}\tmnt = alloc_vfsmnt(old->mnt_devname, true, old->mnt_id);\n"
+                  f"{indent}\tif (mnt) {{\n"
+                  f"{indent}\t\tmnt->mnt.susfs_mnt_id_backup = DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE;\n"
+                  f"{indent}\t}}\n"
+                  f"{indent}\tgoto bypass_orig_flow;\n"
+                  f"{indent}}}\n"
+                  f"{indent}if (likely(is_current_zygote_domain) && (old->mnt_id >= DEFAULT_SUS_MNT_ID)) {{\n"
+                  f"{indent}\tmnt = alloc_vfsmnt(old->mnt_devname, true, 0);\n"
+                  f"{indent}\tgoto bypass_orig_flow;\n"
+                  f"{indent}}}\n"
+                  f"{indent}if ((flag & CL_COPY_MNT_NS) && (old->mnt_id >= DEFAULT_SUS_MNT_ID)) {{\n"
+                  f"{indent}\tmnt = alloc_vfsmnt(old->mnt_devname, true, 0);\n"
+                  f"{indent}\tgoto bypass_orig_flow;\n"
+                  f"{indent}}}\n"
+                  f"{indent}mnt = alloc_vfsmnt(old->mnt_devname, false, 0);\n"
+                  f"{indent}bypass_orig_flow:\n"
+                  f"{indent}#else\n"
+                  f"{indent}{original}\n"
+                  f"{indent}#endif"
+              )
+              clone = clone[:m.start()] + block + clone[m.end():]
+              s = s[:clone_pos] + clone + s[next_fn:]
+              print("Repaired A135F clone_mnt()")
+          else:
+              print("clone_mnt() SUSFS block already present")
 
-              anchor_hits = find_all(lines, anchor)
-              if not anchor_hits:
-                  raise RuntimeError(f'anchor not found in {relpath}: {hunk["header"]}')
-
-              # Find the position of the anchor inside the old block.
-              anchor_offset = None
-              for i in range(len(old_block) - len(anchor) + 1):
-                  if old_block[i:i+len(anchor)] == anchor:
-                      anchor_offset = i
-                      break
-              if anchor_offset is None:
-                  raise RuntimeError(f'internal anchor mismatch in {relpath}: {hunk["header"]}')
-
-              candidates = []
-              old_norm = [norm(x) for x in old_block]
-              for hit in anchor_hits:
-                  start = hit - anchor_offset
-                  if start < 0 or start + len(old_block) > len(lines):
-                      continue
-                  cand = [norm(x) for x in lines[start:start+len(old_block)]]
-                  ratio = difflib.SequenceMatcher(a=old_norm, b=cand, autojunk=False).ratio()
-                  candidates.append((ratio, start))
-
-              candidates.sort(reverse=True)
-              if not candidates:
-                  raise RuntimeError(f'no in-range candidate for {relpath}: {hunk["header"]}')
-
-              best_ratio, best_start = candidates[0]
-              second_ratio = candidates[1][0] if len(candidates) > 1 else 0.0
-
-              # High similarity and a meaningful uniqueness margin are required.
-              if best_ratio < 0.78 or (len(candidates) > 1 and best_ratio - second_ratio < 0.05):
-                  raise RuntimeError(
-                      f'ambiguous/weak relocation in {relpath}: {hunk["header"]}; '
-                      f'best={best_ratio:.3f}, second={second_ratio:.3f}'
-                  )
-
-              return lines[:best_start] + new_block + lines[best_start+len(old_block):]
-
-          rejects = sorted(ROOT.rglob('*.rej'))
-          rejects = [p for p in rejects if '.git' not in p.parts]
-          if not rejects:
-              print('No rejected hunks remain after first-pass patching.')
-              sys.exit(0)
-
-          for rej in rejects:
-              target = pathlib.Path(str(rej)[:-4])
-              if not target.exists():
-                  raise RuntimeError(f'reject target does not exist: {target}')
-
-              lines = target.read_text(errors='replace').splitlines(True)
-              hunks = parse_reject(rej)
-              if not hunks:
-                  raise RuntimeError(f'could not parse reject file: {rej}')
-
-              # Work backwards so line positions remain stable.
-              for hunk in sorted(hunks, key=lambda x: x['old_start'], reverse=True):
-                  lines = apply_hunk(lines, hunk, str(target))
-
-              target.write_text(''.join(lines))
-              rej.unlink()
-              print(f'Repaired {target} from {rej.name}')
-
-          remaining = sorted(ROOT.rglob('*.rej'))
-          remaining = [p for p in remaining if '.git' not in p.parts]
-          if remaining:
-              raise RuntimeError('unresolved .rej files remain:\n' + '\n'.join(map(str, remaining)))
-          print('All SUSFS rejected hunks were repaired unambiguously.')
+          p.write_text(s)
           PY
 
-          python3 /tmp/repair_susfs_rejects.py
+          # The donor patch is expected to leave exactly this one reject,
+          # containing the two namespace call-sites repaired above. Remove it
+          # only after the deterministic A135F repair has completed.
+          if [ -f fs/namespace.c.rej ]; then
+            grep -q 'vfs_kern_mount' fs/namespace.c.rej
+            grep -q 'clone_mnt' fs/namespace.c.rej
+            rm -f fs/namespace.c.rej
+          fi
 
+          # No other reject file is allowed to survive the adaptation stage.
           if find . -type f -name '*.rej' -not -path './.git/*' | grep -q .; then
-            echo 'ERROR: unresolved SUSFS reject files remain.'
+            echo "ERROR: unresolved SUSFS reject files remain:"
+            find . -type f -name '*.rej' -not -path './.git/*' -print
             exit 1
           fi
 
-          # Keep the source tree clean from patch backup files after success.
           find . -type f -name '*.orig' -not -path './.git/*' -delete || true
 
           echo "SUSFS source adaptation complete."
-
+          echo "=== namespace SUSFS call-sites ==="
+          grep -n -A18 -B3 'susfs_is_current_ksu_domain' fs/namespace.c | head -n 120
       # ============================================================
       # 10. KERNELSU MANUAL SYSCALL HOOKS
       # ============================================================
