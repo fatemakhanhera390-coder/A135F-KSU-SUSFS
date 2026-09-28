@@ -237,11 +237,10 @@ jobs:
           grep -E '^#define SUSFS_VERSION' include/linux/susfs.h
 
       # ============================================================
-      # 9. SMART SUSFS ADAPTATION
+      # 9. ADAPT SUSFS PATCH TO A135F 4.19.325
       #
-      # The donor SUSFS 4.19 patch targets a different 4.19 VFS tree.
-      # A135F's namespace.c must NOT receive the donor namespace hunks;
-      # those three call-sites are adapted structurally below.
+      # Namespace is intentionally handled separately because the donor
+      # SUSFS namespace hunks target a different 4.19 VFS layout.
       # ============================================================
       - name: Adapt SUSFS patch to A135F 4.19.325
         shell: bash
@@ -255,23 +254,55 @@ jobs:
           rm -f -- ./*.rej ./*.orig
           find . -type f \( -name '*.rej' -o -name '*.orig' \) -not -path './.git/*' -delete || true
 
-          # Build a patch that EXCLUDES fs/namespace.c.
-          # Use the actual unified-diff header as the state boundary.
-          awk '
-            /^diff --git / {
-              keep = ($0 !~ /^diff --git a\/fs\/namespace\.c b\/fs\/namespace\.c([[:space:]]|$)/)
-            }
-            keep { print }
-          ' "$PATCH_FILE" > /tmp/susfs-no-namespace.patch
+          # Filter the donor patch by FILE before patch(1) sees it.
+          # This avoids unsupported exclude flags and guarantees
+          # that the donor fs/namespace.c hunks cannot be applied.
+          PATCH_FILE="$PATCH_FILE" python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import re
+
+          patch_path = Path(os.environ["PATCH_FILE"])
+          src = patch_path.read_text(errors="replace")
+
+          blocks = re.findall(r'(?ms)^diff --git .*?(?=^diff --git |\Z)', src)
+          if blocks:
+              kept = []
+              for block in blocks:
+                  m = re.search(r'^diff --git a/(.*?) b/(.*?)$', block, re.M)
+                  if m and (m.group(1) == "fs/namespace.c" or m.group(2) == "fs/namespace.c"):
+                      continue
+                  kept.append(block)
+              filtered = ''.join(kept)
+          else:
+              chunks = re.split(r'(?=^--- )', src, flags=re.M)
+              kept = []
+              for chunk in chunks:
+                  if re.search(r'^--- .*fs/namespace\.c(?:\s|$)', chunk, re.M):
+                      continue
+                  if re.search(r'^\+\+\+ .*fs/namespace\.c(?:\s|$)', chunk, re.M):
+                      continue
+                  kept.append(chunk)
+              filtered = ''.join(kept)
+
+          if not filtered.strip():
+              raise SystemExit("ERROR: filtered SUSFS patch is empty")
+          if re.search(r'^diff --git .*fs/namespace\.c', filtered, re.M):
+              raise SystemExit("ERROR: fs/namespace.c diff header survived filtering")
+          if re.search(r'^--- .*fs/namespace\.c(?:\s|$)', filtered, re.M):
+              raise SystemExit("ERROR: fs/namespace.c old-file header survived filtering")
+          if re.search(r'^\+\+\+ .*fs/namespace\.c(?:\s|$)', filtered, re.M):
+              raise SystemExit("ERROR: fs/namespace.c new-file header survived filtering")
+
+          Path('/tmp/susfs-no-namespace.patch').write_text(filtered)
+          print("SUSFS donor patch filtered: fs/namespace.c excluded")
+          PY
 
           test -s /tmp/susfs-no-namespace.patch
-          if grep -q '^diff --git a/fs/namespace\.c b/fs/namespace\.c' /tmp/susfs-no-namespace.patch; then
-            echo "ERROR: fs/namespace.c was not excluded from SUSFS patch"
-            exit 1
-          fi
 
           patch --batch --forward -F3 -p1 < /tmp/susfs-no-namespace.patch || true
 
+          # Repair non-namespace rejects only.
           cat > /tmp/repair_susfs_rejects.py <<'PY'
           import difflib
           import pathlib
@@ -286,180 +317,215 @@ jobs:
           def find_all(seq, needle):
               if not needle or len(needle) > len(seq):
                   return []
-              return [i for i in range(len(seq)-len(needle)+1) if seq[i:i+len(needle)] == needle]
+              n=len(needle)
+              return [i for i in range(len(seq)-n+1) if seq[i:i+n] == needle]
 
           def longest_context_run(body):
-              best, cur = [], []
+              best=[]; cur=[]
               for line in body:
                   if line.startswith(' '):
                       cur.append(line[1:])
                   else:
-                      if len(cur) > len(best):
-                          best = cur
-                      cur = []
-              return max(best, cur, key=len)
+                      if len(cur)>len(best): best=cur
+                      cur=[]
+              if len(cur)>len(best): best=cur
+              return best
 
           def parse_reject(path):
-              hunks, current = [], None
+              hunks=[]; cur=None
               for line in path.read_text(errors='replace').splitlines(True):
-                  m = HUNK_RE.match(line)
+                  m=HUNK_RE.match(line)
                   if m:
-                      if current is not None:
-                          hunks.append(current)
-                      current = {'header':m.group(0), 'old_start':int(m.group(1)), 'body':[]}
-                  elif current is not None and line.startswith((' ', '+', '-')):
-                      current['body'].append(line)
-              if current is not None:
-                  hunks.append(current)
+                      if cur is not None: hunks.append(cur)
+                      cur={'header':m.group(0),'old_start':int(m.group(1)),'body':[]}
+                  elif cur is not None and line.startswith((' ','+','-')):
+                      cur['body'].append(line)
+              if cur is not None: hunks.append(cur)
               return hunks
 
-          def apply_hunk(lines, hunk, relpath):
-              body = hunk['body']
-              old_block = [x[1:] for x in body if x.startswith((' ', '-'))]
-              new_block = [x[1:] for x in body if x.startswith((' ', '+'))]
-              removed = any(x.startswith('-') for x in body)
-
-              exact = find_all(lines, old_block)
-              if len(exact) == 1:
-                  p = exact[0]
-                  return lines[:p] + new_block + lines[p+len(old_block):]
-              if len(exact) > 1:
+          def apply_hunk(lines,hunk,relpath):
+              body=hunk['body']
+              old_block=[x[1:] for x in body if x.startswith((' ','-'))]
+              new_block=[x[1:] for x in body if x.startswith((' ','+'))]
+              exact=find_all(lines,old_block)
+              if len(exact)==1:
+                  p=exact[0]
+                  return lines[:p]+new_block+lines[p+len(old_block):]
+              if len(exact)>1:
                   raise RuntimeError(f'ambiguous exact match in {relpath}: {hunk["header"]}')
 
-              anchor = longest_context_run(body)
-              if len(anchor) < 2:
+              anchor=longest_context_run(body)
+              if len(anchor)<2:
                   raise RuntimeError(f'insufficient stable context in {relpath}: {hunk["header"]}')
-              hits = find_all(lines, anchor)
+              hits=find_all(lines,anchor)
               if not hits:
                   raise RuntimeError(f'anchor not found in {relpath}: {hunk["header"]}')
 
-              offset = None
+              offset=None
               for i in range(len(old_block)-len(anchor)+1):
-                  if old_block[i:i+len(anchor)] == anchor:
-                      offset = i
-                      break
+                  if old_block[i:i+len(anchor)]==anchor:
+                      offset=i; break
               if offset is None:
                   raise RuntimeError(f'internal anchor mismatch in {relpath}: {hunk["header"]}')
-
-              if not removed:
-                  if len(hits) != 1:
-                      raise RuntimeError(f'ambiguous insertion in {relpath}: {hunk["header"]}')
-                  pos = hits[0] - offset
-                  additions = [x[1:] for x in body if x.startswith('+')]
-                  return lines[:pos] + additions + lines[pos:]
 
               candidates=[]
               old_norm=[norm(x) for x in old_block]
               for hit in hits:
                   st=hit-offset
-                  if st < 0 or st+len(old_block)>len(lines):
+                  if st<0 or st+len(old_block)>len(lines):
                       continue
                   cand=[norm(x) for x in lines[st:st+len(old_block)]]
                   ratio=difflib.SequenceMatcher(a=old_norm,b=cand,autojunk=False).ratio()
                   candidates.append((ratio,st))
               candidates.sort(reverse=True)
               if not candidates:
-                  raise RuntimeError(f'no in-range candidate for {relpath}: {hunk["header"]}')
-              best, st = candidates[0]
-              second = candidates[1][0] if len(candidates)>1 else 0.0
-              if best < 0.78 or (len(candidates)>1 and best-second < 0.05):
+                  raise RuntimeError(f'no candidate in {relpath}: {hunk["header"]}')
+              best,st=candidates[0]
+              second=candidates[1][0] if len(candidates)>1 else 0.0
+              if best<0.78 or (len(candidates)>1 and best-second<0.05):
                   raise RuntimeError(f'ambiguous/weak relocation in {relpath}: {hunk["header"]}; best={best:.3f}, second={second:.3f}')
-              return lines[:st] + new_block + lines[st+len(old_block):]
+              return lines[:st]+new_block+lines[st+len(old_block):]
 
           rejects=[p for p in sorted(ROOT.rglob('*.rej')) if '.git' not in p.parts]
-          if not rejects:
-              print('No rejected non-namespace hunks remain after first-pass patching.')
-              raise SystemExit(0)
+          rejects=[p for p in rejects if p.as_posix()!='fs/namespace.c.rej']
 
           for rej in rejects:
               target=pathlib.Path(str(rej)[:-4])
+              if not target.exists():
+                  raise RuntimeError(f'reject target does not exist: {target}')
               lines=target.read_text(errors='replace').splitlines(True)
               hunks=parse_reject(rej)
+              if not hunks:
+                  raise RuntimeError(f'could not parse reject file: {rej}')
               for hunk in sorted(hunks,key=lambda x:x['old_start'],reverse=True):
                   lines=apply_hunk(lines,hunk,str(target))
               target.write_text(''.join(lines))
               rej.unlink()
               print(f'Repaired {target} from {rej.name}')
 
-          remaining=[p for p in sorted(ROOT.rglob('*.rej')) if '.git' not in p.parts]
-          if remaining:
-              raise RuntimeError('unresolved .rej files remain:\n'+'\n'.join(map(str,remaining)))
-          print('All SUSFS non-namespace rejected hunks were repaired unambiguously.')
+          leftovers=[p for p in sorted(ROOT.rglob('*.rej')) if '.git' not in p.parts]
+          leftovers=[p for p in leftovers if p.as_posix()!='fs/namespace.c.rej']
+          if leftovers:
+              raise RuntimeError('unresolved non-namespace rejects remain:\n'+'\n'.join(map(str,leftovers)))
+
+          print('Non-namespace SUSFS patch stage passed.')
           PY
 
           python3 /tmp/repair_susfs_rejects.py
           find . -type f -name '*.orig' -not -path './.git/*' -delete || true
 
-          # Structural fs/namespace.c adaptation on the CLEAN namespace.c.
+          # ------------------------------------------------------------
+          # Structural A135F namespace integration.
+          # IMPORTANT: use alloc_vfsmnt() call-sites, NOT the unreliable
+          # mnt->mnt_parent anchor that caused the previous failure.
+          # ------------------------------------------------------------
           python3 - <<'PY'
           from pathlib import Path
           import re
 
-          path = Path('fs/namespace.c')
-          src = path.read_text()
+          p=Path('fs/namespace.c')
+          s=p.read_text()
 
-          def function_body(text, name):
-              for m in re.finditer(r'\b' + re.escape(name) + r'\s*\(', text):
-                  pos = m.end()-1
-                  depth = 0
-                  i = pos
-                  while i < len(text):
-                      if text[i] == '(':
-                          depth += 1
-                      elif text[i] == ')':
-                          depth -= 1
-                          if depth == 0:
-                              break
-                      i += 1
-                  j = i+1
-                  while j < len(text) and text[j].isspace():
-                      j += 1
-                  if j >= len(text) or text[j] != '{':
+          def find_function(text,name):
+              pat=re.compile(r'\b'+re.escape(name)+r'\s*\(')
+              for m in pat.finditer(text):
+                  pos=m.end()-1
+                  depth=0
+                  i=pos
+                  while i<len(text):
+                      if text[i]=='(': depth+=1
+                      elif text[i]==')':
+                          depth-=1
+                          if depth==0: break
+                      i+=1
+                  j=i+1
+                  while j<len(text):
+                      if text[j]=='{': break
+                      if text[j].isspace():
+                          j+=1; continue
+                      if text.startswith('__',j):
+                          k=j+2
+                          while k<len(text) and (text[k].isalnum() or text[k]=='_'):
+                              k+=1
+                          j=k; continue
+                      break
+                  if j>=len(text) or text[j]!='{':
                       continue
                   depth=0
                   for k in range(j,len(text)):
-                      if text[k]=='{':
-                          depth += 1
+                      if text[k]=='{': depth+=1
                       elif text[k]=='}':
-                          depth -= 1
+                          depth-=1
                           if depth==0:
                               return m.start(),k+1,text[m.start():k+1]
               raise SystemExit(f'Function definition not found: {name}')
 
-          def insert_once(text, name, anchor, block):
-              start,end,body=function_body(text,name)
-              if block.strip() in body:
+          def replace_alloc(text,name,call_re,builder):
+              start,end,body=find_function(text,name)
+              if 'CONFIG_KSU_SUSFS_SUS_MOUNT' in body:
+                  print(name+': SUSFS block already present')
                   return text
-              hits=list(re.finditer(anchor,body))
-              if len(hits)!=1:
-                  raise SystemExit(f'{name}: expected exactly one anchor match, found {len(hits)}')
-              p=hits[0].end()
-              return text[:start] + body[:p] + block + body[p:] + text[end:]
+              ms=list(re.finditer(call_re,body,re.M))
+              if len(ms)!=1:
+                  raise SystemExit(f'{name}: expected exactly one alloc_vfsmnt call, found {len(ms)}')
+              m=ms[0]
+              original=m.group(0).strip()
+              block=builder(original,m.group('i'))
+              return text[:start]+body[:m.start()]+block+body[m.end():]+text[end:]
 
-          vfs_block = r'''
-          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-              /* SUSFS: reorder mounts created by zygote. */
-              if (likely(current->android_kabi_reserved3 & 1)) {
-                  mnt->mnt.android_kabi_reserved1 = current->android_kabi_reserved4++;
-              }
-          #endif
-          '''
+          def vfs_block(original,indent):
+              return f'''\n{indent}#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          {indent}if (unlikely(susfs_is_current_ksu_domain())) {{
+          {indent}\tmnt = alloc_vfsmnt(name, true, 0);
+          {indent}\tgoto bypass_orig_flow;
+          {indent}}}
+          {indent}mnt = alloc_vfsmnt(name, false, 0);
+          {indent}bypass_orig_flow:
+          {indent}#else
+          {indent}{original}
+          {indent}#endif'''
 
-          clone_block = r'''
-          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-              /* SUSFS: reorder mounts created by zygote. */
-              if (likely(current->android_kabi_reserved3 & 1)) {
-                  mnt->mnt.android_kabi_reserved1 = current->android_kabi_reserved4++;
-              }
-              /* Keep SUSFS mounts private when cloned. */
-              if (unlikely(mnt->mnt.mnt_root->d_inode->i_state & 33554432)) {
-                  flag &= (~CL_SLAVE | ~CL_SHARED_TO_SLAVE | ~CL_MAKE_SHARED | CL_PRIVATE);
-              }
-          #endif
-          '''
+          def clone_block(original,indent):
+              return f'''\n{indent}#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          {indent}if (unlikely(susfs_is_current_ksu_domain())) {{
+          {indent}\tif (!(flag & CL_COPY_MNT_NS)) {{
+          {indent}\t\tmnt = alloc_vfsmnt(old->mnt_devname, true, 0);
+          {indent}\t\tgoto bypass_orig_flow;
+          {indent}\t}}
+          {indent}\tmnt = alloc_vfsmnt(old->mnt_devname, true, old->mnt_id);
+          {indent}\tif (mnt)
+          {indent}\t\tmnt->mnt.susfs_mnt_id_backup = DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE;
+          {indent}\tgoto bypass_orig_flow;
+          {indent}}}
+          {indent}if (likely(susfs_is_current_zygote_domain()) && (old->mnt_id >= DEFAULT_SUS_MNT_ID)) {{
+          {indent}\tmnt = alloc_vfsmnt(old->mnt_devname, true, 0);
+          {indent}\tgoto bypass_orig_flow;
+          {indent}}}
+          {indent}if ((flag & CL_COPY_MNT_NS) && (old->mnt_id >= DEFAULT_SUS_MNT_ID)) {{
+          {indent}\tmnt = alloc_vfsmnt(old->mnt_devname, true, 0);
+          {indent}\tgoto bypass_orig_flow;
+          {indent}}}
+          {indent}mnt = alloc_vfsmnt(old->mnt_devname, false, 0);
+          {indent}bypass_orig_flow:
+          {indent}#else
+          {indent}{original}
+          {indent}#endif'''
 
-          copy_block = r'''
-          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          s=replace_alloc(
+              s,'vfs_kern_mount',
+              r'^(?P<i>[ \t]*)mnt[ \t]*=[ \t]*alloc_vfsmnt\s*\(\s*name[^;]*\)\s*;[ \t]*$',
+              vfs_block)
+          s=replace_alloc(
+              s,'clone_mnt',
+              r'^(?P<i>[ \t]*)mnt[ \t]*=[ \t]*alloc_vfsmnt\s*\(\s*old->mnt_devname[^;]*\)\s*;[ \t]*$',
+              clone_block)
+
+          start,end,body=find_function(s,'copy_mnt_ns')
+          if 'Assign fake mount ids to the namespace copied from zygote.' not in body:
+              locks=list(re.finditer(r'(?m)^\s*namespace_unlock\(\);\s*$',body))
+              if len(locks)!=1:
+                  raise SystemExit(f'copy_mnt_ns: expected exactly one namespace_unlock(), found {len(locks)}')
+              block='''\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
               /* Assign fake mount ids to the namespace copied from zygote. */
               {
                   int first_entry_mnt_id = 0;
@@ -484,25 +550,31 @@ jobs:
               }
           #endif
           '''
+              pos=locks[0].start()
+              body=body[:pos]+block+body[pos:]
+              s=s[:start]+body+s[end:]
+              print('copy_mnt_ns: block inserted')
+          else:
+              print('copy_mnt_ns: already present')
 
-          parent_anchor=re.compile(r'mnt\s*->\s*mnt(?:\.)mnt_parent\s*=\s*mnt\s*;')
-          src=insert_once(src,'vfs_kern_mount',parent_anchor,vfs_block)
-          src=insert_once(src,'clone_mnt',parent_anchor,clone_block)
-
-          start,end,body=function_body(src,'copy_mnt_ns')
-          if 'SUSFS: reorder mounts created by zygote' not in body:
-              hits=list(re.finditer(r'(?m)^\s*namespace_unlock\(\);\s*$',body))
-              if len(hits)!=1:
-                  raise SystemExit(f'copy_mnt_ns: expected exactly one namespace_unlock(), found {len(hits)}')
-              p=hits[0].start()
-              body=body[:p]+copy_block+'\n'+body[p:]
-              src=src[:start]+body+src[end:]
-
-          path.write_text(src)
+          p.write_text(s)
           PY
 
-          grep -q 'SUSFS: reorder mounts created by zygote' fs/namespace.c
-          grep -q 'android_kabi_reserved4 = first_entry_mnt_id' fs/namespace.c
+          if [ -f fs/namespace.c.rej ]; then
+            echo 'ERROR: fs/namespace.c.rej exists; namespace filtering failed'
+            cat fs/namespace.c.rej
+            exit 1
+          fi
+
+          if find . -type f -name '*.rej' -not -path './.git/*' | grep -q .; then
+            echo 'ERROR: unresolved SUSFS rejects remain'
+            find . -type f -name '*.rej' -not -path './.git/*' -print
+            exit 1
+          fi
+
+          grep -q 'CONFIG_KSU_SUSFS_SUS_MOUNT' fs/namespace.c
+          grep -q 'susfs_is_current_ksu_domain' fs/namespace.c
+          grep -q 'Assign fake mount ids to the namespace copied from zygote' fs/namespace.c
           echo 'SUSFS namespace structural adaptation: PASS'
 
       # ============================================================
