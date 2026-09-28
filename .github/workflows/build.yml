@@ -3,113 +3,63 @@ name: A135F KernelSU-Next SUSFS MAX ARAF
 on:
   workflow_dispatch:
 
-permissions:
-  contents: read
-
-concurrency:
-  group: a135f-ksun-susfs
-  cancel-in-progress: true
-
 jobs:
   build:
     name: Build 4.19.325-MAX-ARAF
     runs-on: ubuntu-latest
-    timeout-minutes: 150
 
     env:
-      KERNEL_SOURCE: https://github.com/Samsung-Galaxy-A13-A135F-Development/android_kernel_samsung_exynos850.git
+      KERNEL_SOURCE: https://github.com/Samsung-Galaxy-A13-A135F-Development/android_kernel_exynos850.git
       KERNEL_BRANCH: lineage-24.0
-      KERNEL_CONFIG: exynos850-a13nsxx_defconfig
-
-      KSU_REPO: https://github.com/pershoot/KernelSU-Next.git
-      KSU_BRANCH: dev-susfs
-
-      SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
-      SUSFS_BRANCH: kernel-4.19
-
-      KERNEL_LOCALVERSION: -MAX-ARAF
+      DEFCONFIG: exynos850-a13nsxx_defconfig
 
     steps:
 
-      # =========================================================
-      # 1. Checkout our repository
-      # =========================================================
+      # ==========================================
+      # 1. Free disk space
+      # ==========================================
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/local/share/powershell
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          df -h
 
+      # ==========================================
+      # 2. Checkout workflow repository
+      # ==========================================
       - name: Checkout
         uses: actions/checkout@v4
 
-
-      # =========================================================
-      # 2. Free runner storage
-      # =========================================================
-
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
-        with:
-          tool-cache: true
-          android: false
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: false
-
-
-      # =========================================================
+      # ==========================================
       # 3. Install dependencies
-      # =========================================================
-
+      # ==========================================
       - name: Install dependencies
         run: |
-          sudo apt-get update -qq
-
-          sudo apt-get install -y --no-install-recommends \
-            bc \
-            bison \
-            build-essential \
-            ccache \
-            cpio \
-            curl \
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl wget unzip zip bc \
+            bison flex build-essential \
+            cpio rsync python3 \
+            libssl-dev libelf-dev \
             device-tree-compiler \
-            flex \
-            git \
-            libelf-dev \
-            libssl-dev \
-            lz4 \
-            make \
-            python3 \
-            rsync \
-            unzip \
-            zip \
-            zstd
+            lz4
 
-
-      # =========================================================
+      # ==========================================
       # 4. Add swap
-      # =========================================================
-
+      # ==========================================
       - name: Add swap
         run: |
-          sudo fallocate -l 8G /mnt/swapfile
-          sudo chmod 600 /mnt/swapfile
-          sudo mkswap /mnt/swapfile
-          sudo swapon /mnt/swapfile
-
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
           free -h
 
-
-      # =========================================================
-      # 5. Download Android Clang
-      # =========================================================
-        
-        
-        
-        
-        
-        
-        
-        
-        
+      # ==========================================
+      # 5. Setup Android Clang
+      # ==========================================
       - name: Setup Android Clang
         shell: bash
         run: |
@@ -120,37 +70,59 @@ jobs:
 
           URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-kernel-build-2022/clang-r450784e.tar.gz"
 
-          echo "Downloading Android Clang..."
-          curl -fL --retry 5 --retry-delay 10 \
+          echo "Downloading Android Clang r450784e..."
+
+          curl -fL \
+            --retry 8 \
+            --retry-delay 10 \
+            --connect-timeout 30 \
             "$URL" \
             -o "$GITHUB_WORKSPACE/clang.tar.gz"
 
-          echo "Extracting..."
+          echo "Extracting Clang..."
           tar -xzf "$GITHUB_WORKSPACE/clang.tar.gz" -C "$TOOLCHAIN"
 
-          echo "Searching for clang..."
-          CLANG_BIN="$(find "$TOOLCHAIN" -type f -name clang -executable -print -quit)"
+          echo "Checking Clang..."
 
-          if [ -z "$CLANG_BIN" ]; then
-            echo "ERROR: clang executable not found!"
-            find "$TOOLCHAIN" -maxdepth 4 -type f | head -100
-            exit 1
-          fi
+          test -x "$TOOLCHAIN/bin/clang"
+          test -x "$TOOLCHAIN/bin/ld.lld"
 
-          CLANG_DIR="$(dirname "$CLANG_BIN")"
+          echo "Clang found:"
+          "$TOOLCHAIN/bin/clang" --version
 
-          echo "Found clang: $CLANG_BIN"
-          echo "$CLANG_DIR" >> "$GITHUB_PATH"
+          echo "LLD found:"
+          "$TOOLCHAIN/bin/ld.lld" --version
 
-          "$CLANG_BIN" --version    
- 
-      
+          # Current step PATH
+          export PATH="$TOOLCHAIN/bin:$PATH"
 
+          # Future steps PATH
+          echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
 
-      # =========================================================
-      # 6. Clone A135F kernel source
-      # =========================================================
+          # Also persist LLVM variables
+          echo "LLVM=$TOOLCHAIN/bin/" >> "$GITHUB_ENV"
+          echo "PATH=$TOOLCHAIN/bin:$PATH" >> "$GITHUB_ENV"
 
+          echo "================================="
+          echo "CLANG READY"
+          echo "================================="
+
+      # ==========================================
+      # 6. Verify toolchain
+      # ==========================================
+      - name: Verify toolchain
+        run: |
+          set -eux
+
+          which clang
+          which ld.lld
+
+          clang --version
+          ld.lld --version
+
+      # ==========================================
+      # 7. Clone A135F kernel
+      # ==========================================
       - name: Fetch A135F kernel
         run: |
           git clone \
@@ -161,48 +133,40 @@ jobs:
 
           cd kernel
 
-          echo "Kernel source:"
+          echo "Kernel commit:"
           git log -1 --oneline
 
           echo "Kernel version:"
           make kernelversion
 
-
-      # =========================================================
-      # 7. Install KernelSU-Next SUSFS tree
-      # =========================================================
-
+      # ==========================================
+      # 8. Install KernelSU-Next dev-susfs
+      # ==========================================
       - name: Install KernelSU-Next dev-susfs
-        working-directory: kernel
+        shell: bash
         run: |
-          set -e
+          set -euxo pipefail
 
-          echo "Installing KernelSU-Next:"
-          echo "$KSU_REPO"
-          echo "Branch:"
-          echo "$KSU_BRANCH"
+          cd kernel
 
           curl -LSs \
             "https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev-susfs/kernel/setup.sh" \
             | bash -s dev-susfs
 
-          echo ""
-          echo "KernelSU directory:"
-          ls -la drivers/kernelsu
+          test -d drivers/kernelsu
 
-          echo ""
-          echo "KernelSU Kconfig:"
-          grep -n "config KSU" drivers/kernelsu/Kconfig | head
+          echo "KernelSU-Next installed."
+          ls -la drivers/kernelsu | head
 
-
-      # =========================================================
-      # 8. Apply manual hooks for 4.19
-      # =========================================================
-
+      # ==========================================
+      # 9. Apply manual syscall hooks
+      # ==========================================
       - name: Apply KernelSU manual hooks
-        working-directory: kernel
+        shell: bash
         run: |
-          set -e
+          set -euxo pipefail
+
+          cd kernel
 
           curl -LSs \
             "https://raw.githubusercontent.com/Iam-nishan/Jujutsu-kernel/V6/syscall_hook.sh" \
@@ -210,365 +174,233 @@ jobs:
 
           chmod +x syscall_hook.sh
 
-          echo "Applying manual hooks..."
-
           bash syscall_hook.sh
 
-          echo ""
-          echo "Checking manual hooks..."
-
-          grep -R \
-            "ksu_handle_execveat" \
-            fs/exec.c \
-            drivers/kernelsu \
-            >/dev/null
-
-          echo "Manual hooks detected."
-
-
-      # =========================================================
-      # 9. Verify SUSFS is integrated in KSU tree
-      # =========================================================
-
+      # ==========================================
+      # 10. Verify SUSFS integration
+      # ==========================================
       - name: Verify SUSFS integration
-        working-directory: kernel
+        shell: bash
         run: |
-          set -e
+          set -euxo pipefail
 
-          echo "Checking KernelSU SUSFS support..."
+          cd kernel
 
-          if grep -R \
-            "CONFIG_KSU_SUSFS" \
-            drivers/kernelsu/Kconfig \
-            >/dev/null 2>&1; then
+          echo "Checking KernelSU Kconfig..."
 
-            echo "CONFIG_KSU_SUSFS found."
+          grep -R "config KSU" drivers/kernelsu/Kconfig | head -20 || true
 
-          else
+          echo "Checking SUSFS..."
 
-            echo "ERROR: KernelSU-Next SUSFS support was not found."
-            echo "Stopping before compilation."
+          grep -R "KSU_SUSFS" drivers/kernelsu/Kconfig | head -30 || true
+
+          if ! grep -q "KSU_SUSFS" drivers/kernelsu/Kconfig; then
+            echo "ERROR: KernelSU-Next SUSFS integration missing!"
             exit 1
-
           fi
 
-          echo ""
-          echo "SUSFS configuration options:"
+          echo "SUSFS integration detected."
 
-          grep -n \
-            "KSU_SUSFS" \
-            drivers/kernelsu/Kconfig \
-            | head -40
-
-
-      # =========================================================
-      # 10. Configure kernel
-      # =========================================================
-
+      # ==========================================
+      # 11. Configure kernel
+      # ==========================================
       - name: Configure A135F kernel
-        working-directory: kernel
+        shell: bash
         run: |
-          set -e
+          set -euxo pipefail
 
+          cd kernel
+
+          rm -rf out
           mkdir -p out
 
           make \
             O=out \
             ARCH=arm64 \
-            "$KERNEL_CONFIG"
+            "$DEFCONFIG"
 
-          # -----------------------------------------------------
-          # KernelSU
-          # -----------------------------------------------------
-
-          ./scripts/config \
-            --file out/.config \
+          ./scripts/config --file out/.config \
             --enable CONFIG_KSU \
-            --enable CONFIG_KSU_MANUAL_HOOK
-
-
-          # -----------------------------------------------------
-          # SUSFS
-          # -----------------------------------------------------
-
-          ./scripts/config \
-            --file out/.config \
-            --enable CONFIG_KSU_SUSFS
-
-          ./scripts/config \
-            --file out/.config \
-            --enable CONFIG_KSU_SUSFS_SUS_PATH
-
-          ./scripts/config \
-            --file out/.config \
-            --enable CONFIG_KSU_SUSFS_SUS_MOUNT
-
-          ./scripts/config \
-            --enable CONFIG_KSU_SUSFS_SUS_KSTAT
-
-          ./scripts/config \
-            --enable CONFIG_KSU_SUSFS_OPEN_REDIRECT
-
-          ./scripts/config \
-            --enable CONFIG_KSU_SUSFS_SUS_MAP
-
-          ./scripts/config \
-            --enable CONFIG_KSU_SUSFS_ENABLE_LOG
-
-
-          # -----------------------------------------------------
-          # KernelSU support
-          # -----------------------------------------------------
-
-          ./scripts/config \
-            --enable CONFIG_OVERLAY_FS
-
-
-          # -----------------------------------------------------
-          # Disable LTO
-          # -----------------------------------------------------
-
-          ./scripts/config \
-            --disable CONFIG_LTO_CLANG
-
-
-          # -----------------------------------------------------
-          # Disable warnings as errors
-          # -----------------------------------------------------
-
-          ./scripts/config \
+            --enable CONFIG_KSU_MANUAL_HOOK \
+            --enable CONFIG_KPROBES \
+            --enable CONFIG_HAVE_KPROBES \
+            --enable CONFIG_KPROBE_EVENTS \
+            --enable CONFIG_KSU_SUSFS \
+            --enable CONFIG_KSU_SUSFS_SUS_PATH \
+            --enable CONFIG_KSU_SUSFS_SUS_MOUNT \
+            --enable CONFIG_KSU_SUSFS_SUS_KSTAT \
+            --enable CONFIG_KSU_SUSFS_OPEN_REDIRECT \
+            --enable CONFIG_KSU_SUSFS_SUS_MAP \
+            --enable CONFIG_KSU_SUSFS_ENABLE_LOG \
+            --enable CONFIG_OVERLAY_FS \
+            --disable CONFIG_LTO_CLANG \
+            --disable CONFIG_LTO_NONE \
             --disable CONFIG_WERROR
 
-
-          # -----------------------------------------------------
-          # MAX ARAF kernel name
-          # -----------------------------------------------------
-
-          ./scripts/config \
-            --set-str CONFIG_LOCALVERSION "$KERNEL_LOCALVERSION"
-
-
-          # -----------------------------------------------------
-          # Finalize config
-          # -----------------------------------------------------
+          ./scripts/config --file out/.config \
+            --set-str CONFIG_LOCALVERSION "-MAX-ARAF"
 
           make \
             O=out \
             ARCH=arm64 \
             olddefconfig
 
-
-          echo ""
-          echo "===== FINAL KERNEL CONFIG ====="
+          echo "=============================="
+          echo "KERNELSU CONFIG"
+          echo "=============================="
 
           grep -E \
-            "CONFIG_KSU=|CONFIG_KSU_MANUAL_HOOK=|CONFIG_KSU_SUSFS=|CONFIG_KSU_SUSFS_SUS_PATH=|CONFIG_KSU_SUSFS_SUS_MOUNT=|CONFIG_KSU_SUSFS_SUS_KSTAT=|CONFIG_KSU_SUSFS_OPEN_REDIRECT=|CONFIG_KSU_SUSFS_SUS_MAP=|CONFIG_LOCALVERSION=" \
+            'CONFIG_KSU=|CONFIG_KSU_MANUAL_HOOK=|CONFIG_KSU_SUSFS=' \
             out/.config
 
+          echo "=============================="
+          echo "LOCALVERSION"
+          echo "=============================="
 
-      # =========================================================
-      # 11. Build kernel
-      # =========================================================
+          grep CONFIG_LOCALVERSION out/.config
 
+      # ==========================================
+      # 12. Build kernel
+      # ==========================================
       - name: Build kernel
-        working-directory: kernel
+        shell: bash
         run: |
-          set -e
+          set -euxo pipefail
 
-          export ARCH=arm64
-
-          export CROSS_COMPILE=aarch64-linux-gnu-
+          cd kernel
 
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
 
-          echo "Compiler:"
-          clang --version
-
-          echo ""
-          echo "Building:"
-          echo "4.19.325-MAX-ARAF"
-
           make \
             O=out \
             ARCH=arm64 \
-            CC=clang \
-            LD=ld.lld \
             LLVM=1 \
             LLVM_IAS=1 \
-            KCFLAGS=-Wno-error=strict-prototypes \
+            CC=clang \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
+            HOSTCC=gcc \
+            HOSTCXX=g++ \
+            KCFLAGS="-Wno-error=strict-prototypes" \
             -j"$(nproc)"
 
-
-      # =========================================================
-      # 12. Verify kernel image
-      # =========================================================
-
+      # ==========================================
+      # 13. Verify Image.gz
+      # ==========================================
       - name: Verify kernel image
-        working-directory: kernel
         run: |
-          set -e
+          set -eux
 
-          echo "Searching kernel image..."
+          cd kernel
 
-          find out/arch/arm64/boot \
-            -maxdepth 1 \
-            -type f \
-            -printf "%f %s bytes\n"
+          ls -lh out/arch/arm64/boot/
 
-          if [ -f out/arch/arm64/boot/Image.gz ]; then
-            echo "Image.gz found."
-          else
-            echo "ERROR: Image.gz not found."
-            exit 1
-          fi
+          test -f out/arch/arm64/boot/Image.gz
 
-          echo ""
-          echo "Kernel release:"
+          file out/arch/arm64/boot/Image.gz
 
-          make \
-            O=out \
-            ARCH=arm64 \
-            kernelrelease
-
-
-      # =========================================================
-      # 13. Clone AnyKernel3
-      # =========================================================
-
+      # ==========================================
+      # 14. Prepare AnyKernel3
+      # ==========================================
       - name: Prepare AnyKernel3
         run: |
-          set -e
-
-          git clone \
-            --depth=1 \
+          git clone --depth=1 \
             https://github.com/osm0sis/AnyKernel3.git \
             AnyKernel3
 
-          cp \
-            kernel/out/arch/arm64/boot/Image.gz \
-            AnyKernel3/Image.gz
+          cp kernel/out/arch/arm64/boot/Image.gz \
+            AnyKernel3/
 
-
-      # =========================================================
-      # 14. Configure AnyKernel3 for SM-A135F
-      # =========================================================
-
+      # ==========================================
+      # 15. Configure AnyKernel3
+      # ==========================================
       - name: Configure AnyKernel3
-        working-directory: AnyKernel3
+        shell: bash
         run: |
-          set -e
-
-          cat > anykernel.sh <<'EOF'
-          properties() { '
-          kernel.string=MAX ARAF KernelSU-Next SUSFS
-          do.devicecheck=0
-          do.modules=0
-          do.systemless=0
-          do.cleanup=1
-          do.cleanuponabort=0
-          device.name1=SM-A135F
-          device.name2=SM-A135F/DS
-          device.name3=a13
-          device.name4=
-          device.name5=
-          supported.versions=
-          supported.patchlevels=
-          '; }
-
-          block=/dev/block/by-name/boot
-          is_slot_device=0
-
-          . tools/ak3-core.sh
-          split_boot
-          flash_boot
-          dump_boot
-          write_boot
-          exit 0
-          EOF
-
-          echo "AnyKernel configuration:"
-          cat anykernel.sh
-
-
-      # =========================================================
-      # 15. Create flashable ZIP
-      # =========================================================
-
-      - name: Package AnyKernel3
-        run: |
-          set -e
+          set -euxo pipefail
 
           cd AnyKernel3
 
-          ZIP_NAME="A135F-4.19.325-MAX-ARAF-KSUN-SUSFS.zip"
+          sed -i \
+            's/^kernel.string=.*/kernel.string=A135F KernelSU-Next SUSFS MAX ARAF/' \
+            anykernel.sh
+
+          sed -i \
+            's/^device.name1=.*/device.name1=SM-A135F/' \
+            anykernel.sh
+
+          sed -i \
+            's/^device.name2=.*/device.name2=SM-A135F\/DS/' \
+            anykernel.sh
+
+          echo "AnyKernel3 configured."
+
+          grep -E \
+            'kernel.string|device.name' \
+            anykernel.sh || true
+
+      # ==========================================
+      # 16. Package
+      # ==========================================
+      - name: Package AnyKernel3
+        run: |
+          set -eux
+
+          cd AnyKernel3
+
+          rm -rf .git .github README.md
 
           zip -r9 \
-            "../$ZIP_NAME" \
+            ../A135F-4.19.325-MAX-ARAF-KSUN-SUSFS.zip \
             . \
-            -x '.git/*' \
-            -x 'README.md'
+            -x "*.git*"
 
-          cd ..
-
-          ls -lh "$ZIP_NAME"
-
-
-      # =========================================================
-      # 16. Create raw kernel artifact
-      # =========================================================
-
+      # ==========================================
+      # 17. Copy raw kernel
+      # ==========================================
       - name: Copy raw kernel
         run: |
           cp \
             kernel/out/arch/arm64/boot/Image.gz \
-            "A135F-4.19.325-MAX-ARAF-Image.gz"
+            A135F-4.19.325-MAX-ARAF-Image.gz
 
-          ls -lh \
-            "A135F-4.19.325-MAX-ARAF-Image.gz"
-
-
-      # =========================================================
-      # 17. Upload flashable ZIP
-      # =========================================================
-
+      # ==========================================
+      # 18. Upload AnyKernel3
+      # ==========================================
       - name: Upload AnyKernel3
         uses: actions/upload-artifact@v4
         with:
           name: A135F-4.19.325-MAX-ARAF-KSUN-SUSFS
           path: A135F-4.19.325-MAX-ARAF-KSUN-SUSFS.zip
-          if-no-files-found: error
+          retention-days: 7
 
-
-      # =========================================================
-      # 18. Upload raw Image.gz
-      # =========================================================
-
+      # ==========================================
+      # 19. Upload Image.gz
+      # ==========================================
       - name: Upload Image.gz
         uses: actions/upload-artifact@v4
         with:
           name: A135F-4.19.325-MAX-ARAF-Image
           path: A135F-4.19.325-MAX-ARAF-Image.gz
-          if-no-files-found: error
+          retention-days: 7
 
-
-      # =========================================================
-      # 19. Final verification
-      # =========================================================
-
+      # ==========================================
+      # 20. Build summary
+      # ==========================================
       - name: Build summary
         run: |
-          echo "========================================"
-          echo "       MAX ARAF KERNEL BUILD"
-          echo "========================================"
+          echo "========================================="
+          echo " A135F KernelSU-Next + SUSFS"
+          echo " MAX ARAF BUILD"
+          echo "========================================="
           echo ""
-          echo "Device : SM-A135F/DS"
-          echo "Kernel : 4.19.325-MAX-ARAF"
-          echo "Root   : KernelSU-Next"
-          echo "SUSFS  : Enabled"
+          echo "Kernel: 4.19.325"
+          echo "Device: SM-A135F/DS"
+          echo "KSU: KernelSU-Next"
+          echo "SUSFS: enabled"
           echo ""
-          echo "Artifacts:"
-          ls -lh \
-            A135F-4.19.325-MAX-ARAF-KSUN-SUSFS.zip \
-            A135F-4.19.325-MAX-ARAF-Image.gz
-          echo ""
-          echo "BUILD SUCCESS."
+          echo "BUILD SUCCESSFUL"
