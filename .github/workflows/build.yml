@@ -300,7 +300,7 @@ jobs:
           )
 
           if "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT" not in fn:
-              m = re.search(r'(?m)^(?P<indent>[ \t]*)mnt[ \t]*=[ \t]*alloc_vfsmnt\([^;]*\);[ \t]*$', fn)
+              m = re.search(r'(?ms)^(?P<indent>[ \t]*)mnt[ \t]*=[ \t]*alloc_vfsmnt\s*\([^;]*?\)\s*;[ \t]*$', fn)
               if not m:
                   raise SystemExit("ERROR: A135F vfs_kern_mount() alloc_vfsmnt statement not found")
 
@@ -339,7 +339,7 @@ jobs:
 
           if "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT" not in fn:
               # First alloc_vfsmnt in clone_mnt is the original flow.
-              m = re.search(r'(?m)^(?P<indent>[ \t]*)mnt[ \t]*=[ \t]*alloc_vfsmnt\([^;]*\);[ \t]*$', fn)
+              m = re.search(r'(?ms)^(?P<indent>[ \t]*)mnt[ \t]*=[ \t]*alloc_vfsmnt\s*\([^;]*?\)\s*;[ \t]*$', fn)
               if not m:
                   raise SystemExit("ERROR: A135F clone_mnt() alloc_vfsmnt statement not found")
 
