@@ -280,6 +280,11 @@ jobs:
 
           # ------------------------------------------------------------
           # A135F-specific repair #1: vfs_kern_mount()
+          #
+          # Do NOT search for a particular alloc_vfsmnt() signature here.
+          # Samsung's A135F tree can carry a vendor-modified call form.
+          # Instead, replace only the allocation region between the known
+          # vfs_kern_mount() type check and its existing NULL check.
           # ------------------------------------------------------------
           vfs_pos = s.find("vfs_kern_mount(")
           clone_pos = s.find("static struct mount *clone_mnt(", vfs_pos)
@@ -289,18 +294,32 @@ jobs:
           vfs = s[vfs_pos:clone_pos]
 
           if "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT" not in vfs:
-              m = re.search(
-                  r'(?m)^(?P<indent>[ \t]*)mnt[ \t]*=[ \t]*alloc_vfsmnt\(name(?P<args>(?:,[^;]*)?)\);[ \t]*$',
-                  vfs,
-              )
-              if not m:
-                  raise SystemExit("ERROR: A135F vfs_kern_mount alloc_vfsmnt(name...) call not found")
+              type_check = vfs.find("\n\tif (!type)")
+              if type_check < 0:
+                  type_check = vfs.find("\n    if (!type)")
+              if type_check < 0:
+                  raise SystemExit("ERROR: A135F vfs_kern_mount() type-check anchor not found")
 
-              indent = m.group("indent")
-              original = m.group(0).strip()
+              ret_end = vfs.find("return ERR_PTR(-ENODEV);", type_check)
+              if ret_end < 0:
+                  raise SystemExit("ERROR: A135F vfs_kern_mount() ENODEV return not found")
+              ret_end = vfs.find("\n", ret_end)
+              if ret_end < 0:
+                  raise SystemExit("ERROR: malformed vfs_kern_mount() ENODEV block")
+
+              null_check = vfs.find("\n\tif (!mnt)", ret_end)
+              if null_check < 0:
+                  null_check = vfs.find("\n    if (!mnt)", ret_end)
+              if null_check < 0:
+                  raise SystemExit("ERROR: A135F vfs_kern_mount() NULL-check anchor not found")
+
+              # Preserve indentation used by the function's existing code.
+              indent = "\t"
+              if "\n    if (!mnt)" in vfs:
+                  indent = "    "
 
               block = (
-                  f"{indent}#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+                  f"\n{indent}#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
                   f"{indent}if (unlikely(susfs_is_current_ksu_domain())) {{\n"
                   f"{indent}\tmnt = alloc_vfsmnt(name, true, 0);\n"
                   f"{indent}\tgoto bypass_orig_flow;\n"
@@ -308,18 +327,21 @@ jobs:
                   f"{indent}mnt = alloc_vfsmnt(name, false, 0);\n"
                   f"{indent}bypass_orig_flow:\n"
                   f"{indent}#else\n"
-                  f"{indent}{original}\n"
+                  f"{indent}mnt = alloc_vfsmnt(name);\n"
                   f"{indent}#endif"
               )
-              vfs = vfs[:m.start()] + block + vfs[m.end():]
+              vfs = vfs[:ret_end] + block + vfs[null_check:]
               s = s[:vfs_pos] + vfs + s[clone_pos:]
               clone_pos = s.find("static struct mount *clone_mnt(", vfs_pos)
-              print("Repaired A135F vfs_kern_mount()")
+              print("Repaired A135F vfs_kern_mount() by structural anchors")
           else:
               print("vfs_kern_mount() SUSFS block already present")
 
           # ------------------------------------------------------------
           # A135F-specific repair #2: clone_mnt()
+          #
+          # Again use structural anchors instead of assuming the exact
+          # vendor alloc_vfsmnt() signature.
           # ------------------------------------------------------------
           clone_pos = s.find("static struct mount *clone_mnt(")
           next_fn = s.find("\nstatic ", clone_pos + 1)
@@ -328,24 +350,34 @@ jobs:
           clone = s[clone_pos:next_fn]
 
           if "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT" not in clone:
-              m = re.search(
-                  r'(?m)^(?P<indent>[ \t]*)mnt[ \t]*=[ \t]*alloc_vfsmnt\(old->mnt_devname(?P<args>(?:,[^;]*)?)\);[ \t]*$',
-                  clone,
-              )
-              if not m:
-                  raise SystemExit("ERROR: A135F clone_mnt alloc_vfsmnt(old->mnt_devname...) call not found")
+              decl = clone.find("\n\tstruct mount *mnt;")
+              if decl < 0:
+                  decl = clone.find("\n    struct mount *mnt;")
+              if decl < 0:
+                  raise SystemExit("ERROR: A135F clone_mnt() mount declaration anchor not found")
 
-              indent = m.group("indent")
-              original = m.group(0).strip()
+              err_line = clone.find("int err;", decl)
+              if err_line < 0:
+                  raise SystemExit("ERROR: A135F clone_mnt() int err anchor not found")
+              err_end = clone.find("\n", err_line)
+              if err_end < 0:
+                  raise SystemExit("ERROR: malformed clone_mnt() declaration block")
+
+              null_check = clone.find("\n\tif (!mnt)", err_end)
+              if null_check < 0:
+                  null_check = clone.find("\n    if (!mnt)", err_end)
+              if null_check < 0:
+                  raise SystemExit("ERROR: A135F clone_mnt() NULL-check anchor not found")
+
+              indent = "\t"
+              if "\n    if (!mnt)" in clone:
+                  indent = "    "
 
               block = (
-                  f"{indent}#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+                  f"\n{indent}#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
                   f"{indent}bool is_current_ksu_domain = susfs_is_current_ksu_domain();\n"
                   f"{indent}bool is_current_zygote_domain = susfs_is_current_zygote_domain();\n\n"
-                  f"{indent}/*\n"
-                  f"{indent} * KSU/zygote SUSFS mount-id handling. CL_COPY_MNT_NS\n"
-                  f"{indent} * distinguishes an unshare/copy-tree operation from a single clone.\n"
-                  f"{indent} */\n"
+                  f"{indent}/* KSU/zygote SUSFS mount-id handling. */\n"
                   f"{indent}if (unlikely(is_current_ksu_domain)) {{\n"
                   f"{indent}\tif (!(flag & CL_COPY_MNT_NS)) {{\n"
                   f"{indent}\t\tmnt = alloc_vfsmnt(old->mnt_devname, true, 0);\n"
@@ -368,12 +400,12 @@ jobs:
                   f"{indent}mnt = alloc_vfsmnt(old->mnt_devname, false, 0);\n"
                   f"{indent}bypass_orig_flow:\n"
                   f"{indent}#else\n"
-                  f"{indent}{original}\n"
+                  f"{indent}mnt = alloc_vfsmnt(old->mnt_devname);\n"
                   f"{indent}#endif"
               )
-              clone = clone[:m.start()] + block + clone[m.end():]
+              clone = clone[:err_end] + block + clone[null_check:]
               s = s[:clone_pos] + clone + s[next_fn:]
-              print("Repaired A135F clone_mnt()")
+              print("Repaired A135F clone_mnt() by structural anchors")
           else:
               print("clone_mnt() SUSFS block already present")
 
