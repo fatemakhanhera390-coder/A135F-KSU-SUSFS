@@ -232,16 +232,39 @@ jobs:
         run: |
           set -euxo pipefail
 
-          cd KernelSU-Next
+          echo "Current kernel root:"
+          pwd
 
-          bash kernel/setup.sh legacy
+          test -d drivers
+          test -f Makefile
 
-          cd ..
+          # Official KernelSU-Next setup script.
+          # IMPORTANT:
+          # Run it from the KERNEL SOURCE ROOT, not inside
+          # the KernelSU-Next repository.
+          curl -L \
+            --retry 8 \
+            --retry-all-errors \
+            --connect-timeout 30 \
+            --max-time 300 \
+            https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh \
+            -o /tmp/ksu-setup.sh
+
+          test -s /tmp/ksu-setup.sh
+
+          chmod +x /tmp/ksu-setup.sh
+
+          /tmp/ksu-setup.sh legacy
+
+          echo
+          echo "===== VERIFY KERNELSU DRIVER ====="
 
           test -d drivers/kernelsu
           test -f drivers/kernelsu/Kconfig
           test -f drivers/kernelsu/Makefile
+          test -f drivers/kernelsu/ksu.c
 
+          echo
           echo "KernelSU-Next legacy driver: PASS"
 
       # ========================================================
