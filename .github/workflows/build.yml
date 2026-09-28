@@ -101,48 +101,50 @@ jobs:
       # =========================================================
       # 5. Download Android Clang
       # =========================================================
-
+        
+        
+        
+        
+        
+        
+        
+        
+        
       - name: Setup Android Clang
+        shell: bash
         run: |
-          set -e
+          set -euxo pipefail
 
           TOOLCHAIN="$GITHUB_WORKSPACE/clang"
-
           mkdir -p "$TOOLCHAIN"
 
           URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-kernel-build-2022/clang-r450784e.tar.gz"
 
-          echo "Downloading:"
-          echo "$URL"
+          echo "Downloading Android Clang..."
+          curl -fL --retry 5 --retry-delay 10 \
+            "$URL" \
+            -o "$GITHUB_WORKSPACE/clang.tar.gz"
 
-          for i in 1 2 3 4 5 6; do
-            echo "Attempt $i/6..."
+          echo "Extracting..."
+          tar -xzf "$GITHUB_WORKSPACE/clang.tar.gz" -C "$TOOLCHAIN"
 
-            if curl -fL \
-              --retry 3 \
-              --retry-delay 5 \
-              --connect-timeout 30 \
-              "$URL" \
-              -o "$GITHUB_WORKSPACE/clang.tar.gz"; then
-              break
-            fi
+          echo "Searching for clang..."
+          CLANG_BIN="$(find "$TOOLCHAIN" -type f -name clang -executable -print -quit)"
 
-            if [ "$i" = "6" ]; then
-              echo "ERROR: Unable to download Android Clang."
-              exit 1
-            fi
+          if [ -z "$CLANG_BIN" ]; then
+            echo "ERROR: clang executable not found!"
+            find "$TOOLCHAIN" -maxdepth 4 -type f | head -100
+            exit 1
+          fi
 
-            sleep 10
-          done
+          CLANG_DIR="$(dirname "$CLANG_BIN")"
 
-          tar -xzf "$GITHUB_WORKSPACE/clang.tar.gz" \
-            -C "$TOOLCHAIN"
+          echo "Found clang: $CLANG_BIN"
+          echo "$CLANG_DIR" >> "$GITHUB_PATH"
 
-          test -x "$TOOLCHAIN/bin/clang"
-
-          echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
-
-          clang --version
+          "$CLANG_BIN" --version    
+ 
+      
 
 
       # =========================================================
