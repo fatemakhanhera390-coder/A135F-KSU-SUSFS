@@ -11,6 +11,7 @@ env:
   KERNEL_BRANCH: lineage-24.0
   DEFCONFIG: exynos850-a13nsxx_defconfig
 
+  # SUSFS-aware KernelSU-Next branch for legacy 4.19.
   KSU_REPO: https://github.com/SuleMareVientu/KernelSU-Next.git
   KSU_BRANCH: next-susfs-4.19
 
@@ -21,11 +22,10 @@ env:
 
 jobs:
   build:
-    name: Build A135F KernelSU-Next SUSFS
+    name: Build A135F KernelSU-Next + SUSFS
     runs-on: ubuntu-24.04
 
     steps:
-
       # ============================================================
       # 1. FREE DISK
       # ============================================================
@@ -33,16 +33,14 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-
           sudo rm -rf /usr/local/lib/android/sdk/ndk || true
           sudo rm -rf /usr/share/dotnet || true
           sudo rm -rf /opt/ghc || true
           sudo rm -rf /usr/local/share/powershell || true
-
           df -h
 
       # ============================================================
-      # 2. CHECKOUT THIS REPOSITORY
+      # 2. CHECKOUT BUILD REPOSITORY
       # ============================================================
       - name: Checkout build repository
         uses: actions/checkout@v4
@@ -54,9 +52,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-
           sudo apt-get update
-
           sudo apt-get install -y \
             bc \
             bison \
@@ -72,8 +68,8 @@ jobs:
             libncurses-dev \
             libssl-dev \
             lz4 \
+            patch \
             python3 \
-            python3-pip \
             rsync \
             unzip \
             wget \
@@ -82,11 +78,7 @@ jobs:
             zstd
 
       # ============================================================
-      # 4. SETUP ANDROID CLANG
-      #
-      # r450784e is deliberately used for this 4.19 kernel.
-      # GitHub mirror is used instead of android.googlesource
-      # because we already hit repeated HTTP 503 there.
+      # 4. SETUP ANDROID CLANG r450784e
       # ============================================================
       - name: Setup Android Clang r450784e
         shell: bash
@@ -95,13 +87,10 @@ jobs:
 
           TOOLCHAIN="$HOME/android-clang"
           ARCHIVE="$RUNNER_TEMP/clang-r450784e.tar.gz"
-
           URL="https://github.com/ravindu644/Android-Kernel-Tutorials/releases/download/toolchains/clang-r450784e.tar.gz"
 
           rm -rf "$TOOLCHAIN"
           mkdir -p "$TOOLCHAIN"
-
-          echo "Downloading clang-r450784e..."
 
           curl -fL \
             --retry 10 \
@@ -113,37 +102,26 @@ jobs:
             -o "$ARCHIVE"
 
           test -s "$ARCHIVE"
-
-          echo "Extracting toolchain..."
-
           tar -xzf "$ARCHIVE" -C "$TOOLCHAIN"
 
-          echo "Checking required LLVM binaries..."
-
+          # clang and LLVM binutils may be symlinks, so use -e/-x.
           test -x "$TOOLCHAIN/bin/clang"
-
-          # ld.lld / llvm tools can be symlinks.
           test -e "$TOOLCHAIN/bin/ld.lld"
           test -x "$TOOLCHAIN/bin/ld.lld"
-
           test -e "$TOOLCHAIN/bin/lld"
           test -x "$TOOLCHAIN/bin/lld"
-
           test -x "$TOOLCHAIN/bin/llvm-ar"
           test -x "$TOOLCHAIN/bin/llvm-nm"
           test -x "$TOOLCHAIN/bin/llvm-objcopy"
           test -x "$TOOLCHAIN/bin/llvm-objdump"
           test -x "$TOOLCHAIN/bin/llvm-strip"
           test -x "$TOOLCHAIN/bin/llvm-readelf"
-          test -x "$TOOLCHAIN/bin/llvm-size"
 
           echo "LLVM_HOME=$TOOLCHAIN" >> "$GITHUB_ENV"
           echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
 
           "$TOOLCHAIN/bin/clang" --version
           "$TOOLCHAIN/bin/ld.lld" --version
-
-          echo "Android clang-r450784e ready."
 
       # ============================================================
       # 5. VERIFY TOOLCHAIN
@@ -152,19 +130,17 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-
           test -x "$LLVM_HOME/bin/clang"
-          test -e "$LLVM_HOME/bin/ld.lld"
           test -x "$LLVM_HOME/bin/ld.lld"
-
+          test -x "$LLVM_HOME/bin/llvm-ar"
+          test -x "$LLVM_HOME/bin/llvm-nm"
+          test -x "$LLVM_HOME/bin/llvm-objcopy"
+          test -x "$LLVM_HOME/bin/llvm-strip"
           "$LLVM_HOME/bin/clang" --version
           "$LLVM_HOME/bin/ld.lld" --version
-
           command -v python3
           command -v make
           command -v git
-
-          echo "Toolchain verification passed."
 
       # ============================================================
       # 6. FETCH A135F KERNEL
@@ -173,7 +149,6 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-
           git clone \
             --depth=1 \
             --branch "$KERNEL_BRANCH" \
@@ -181,39 +156,23 @@ jobs:
             kernel
 
           cd kernel
-
-          echo "Kernel source:"
-          git remote -v
-
           echo "Kernel commit:"
           git log -1 --oneline
-
           echo "Kernel version:"
           make kernelversion
-
           test "$(make kernelversion)" = "4.19.325"
-
           test -f "arch/arm64/configs/$DEFCONFIG"
 
-          echo "A135F kernel source verification passed."
-
       # ============================================================
-      # 7. INSTALL KERNELSU-NEXT SUSFS-AWARE BRANCH
-      #
-      # IMPORTANT:
-      # DO NOT APPLY the old
-      # 10_enable_susfs_for_ksu.patch here.
-      #
-      # This KSU-Next branch already contains the SUSFS-side
-      # KSU integration/configuration.
+      # 7. INSTALL KERNELSU-NEXT
       # ============================================================
-      - name: Install KernelSU-Next SUSFS 4.19
+      - name: Install KernelSU-Next legacy driver
         shell: bash
         working-directory: kernel
         run: |
           set -euxo pipefail
 
-          rm -rf KernelSU-Next
+          rm -rf KernelSU-Next drivers/kernelsu
 
           git clone \
             --depth=1 \
@@ -221,35 +180,24 @@ jobs:
             "$KSU_REPO" \
             KernelSU-Next
 
-          test -d KernelSU-Next/kernel
           test -f KernelSU-Next/kernel/Kconfig
           test -f KernelSU-Next/kernel/Makefile
+          test -f KernelSU-Next/kernel/core_hook.c
+          test -f KernelSU-Next/kernel/ksu.c
 
-          echo "Checking KernelSU-Next SUSFS support..."
+          grep -q 'config KSU' KernelSU-Next/kernel/Kconfig
+          grep -q 'config KSU_SUSFS' KernelSU-Next/kernel/Kconfig
 
-          grep -q "config KSU_SUSFS" \
-            KernelSU-Next/kernel/Kconfig
-
-          grep -q "KSU_SUSFS" \
-            KernelSU-Next/kernel/Kconfig
-
-          grep -q "susfs.c" \
-            KernelSU-Next/kernel/Makefile || true
-
-          rm -rf drivers/kernelsu
-
-          ln -s \
-            "$(pwd)/KernelSU-Next/kernel" \
-            drivers/kernelsu
+          ln -s "$(pwd)/KernelSU-Next/kernel" drivers/kernelsu
 
           test -L drivers/kernelsu
           test -f drivers/kernelsu/Kconfig
           test -f drivers/kernelsu/Makefile
 
-          echo "KernelSU-Next integration prepared."
+          echo "KernelSU-Next legacy driver linked."
 
       # ============================================================
-      # 8. INSTALL SUSFS KERNEL-SIDE SOURCES
+      # 8. FETCH + COPY COMPLETE SUSFS KERNEL SOURCES
       # ============================================================
       - name: Install SUSFS kernel sources
         shell: bash
@@ -265,111 +213,241 @@ jobs:
             "$SUSFS_REPO" \
             susfs4ksu
 
-          # Required SUSFS files
+          # These five files are all required by the kernel-side SUSFS tree.
           test -f susfs4ksu/kernel_patches/fs/susfs.c
           test -f susfs4ksu/kernel_patches/fs/sus_su.c
-
           test -f susfs4ksu/kernel_patches/include/linux/susfs.h
+          test -f susfs4ksu/kernel_patches/include/linux/susfs_def.h
           test -f susfs4ksu/kernel_patches/include/linux/sus_su.h
+          test -f susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch
 
-          test -f \
-            susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch
+          cp -fv susfs4ksu/kernel_patches/fs/susfs.c fs/susfs.c
+          cp -fv susfs4ksu/kernel_patches/fs/sus_su.c fs/sus_su.c
+          cp -fv susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/susfs.h
+          cp -fv susfs4ksu/kernel_patches/include/linux/susfs_def.h include/linux/susfs_def.h
+          cp -fv susfs4ksu/kernel_patches/include/linux/sus_su.h include/linux/sus_su.h
 
-          # Copy kernel-side SUSFS sources.
-          cp -fv \
-            susfs4ksu/kernel_patches/fs/susfs.c \
-            fs/susfs.c
-
-          cp -fv \
-            susfs4ksu/kernel_patches/fs/sus_su.c \
-            fs/sus_su.c
-
-          cp -fv \
-            susfs4ksu/kernel_patches/include/linux/susfs.h \
-            include/linux/susfs.h
-
-          cp -fv \
-            susfs4ksu/kernel_patches/include/linux/sus_su.h \
-            include/linux/sus_su.h
-
-          # Verify copies.
           test -f fs/susfs.c
           test -f fs/sus_su.c
           test -f include/linux/susfs.h
+          test -f include/linux/susfs_def.h
           test -f include/linux/sus_su.h
 
-          echo "SUSFS kernel sources installed."
-
           echo "SUSFS version:"
-          grep -E '^#define SUSFS_VERSION' \
-            include/linux/susfs.h || true
+          grep -E '^#define SUSFS_VERSION' include/linux/susfs.h
 
       # ============================================================
-      # 9. APPLY SUSFS KERNEL PATCH
+      # 9. SMART SUSFS ADAPTATION
       #
-      # Dry-run first.
-      # If already applied, detect it instead of failing.
-      # No fuzzy/unsafe patching.
+      # The donor SUSFS 4.19 patch was written for a different 4.19
+      # tree. A135F's Samsung VFS files are not identical. Therefore:
+      #   1) apply what matches normally with limited context drift;
+      #   2) repair only rejected hunks when the old block/context can
+      #      be located uniquely;
+      #   3) abort on an ambiguous/unmatched hunk;
+      #   4) never use --force and never silently ignore .rej files.
       # ============================================================
-      - name: Apply SUSFS kernel patch
+      - name: Adapt SUSFS patch to A135F 4.19.325
         shell: bash
         working-directory: kernel
         run: |
           set -euxo pipefail
 
           PATCH_FILE="susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch"
-
           test -f "$PATCH_FILE"
 
-          echo "Testing SUSFS kernel patch..."
+          rm -f -- ./*.rej ./*.orig
+          find . -type f \( -name '*.rej' -o -name '*.orig' \) -not -path './.git/*' -delete || true
 
-          if patch \
-              --dry-run \
-              --batch \
-              --forward \
-              --fuzz=0 \
-              -p1 < "$PATCH_FILE"
-          then
-            echo "SUSFS patch applies cleanly."
+          # First pass: modest context drift is okay; large/ambiguous drift is not.
+          patch --batch --forward -F3 -p1 < "$PATCH_FILE" || true
 
-            patch \
-              --batch \
-              --forward \
-              --fuzz=0 \
-              -p1 < "$PATCH_FILE"
+          cat > /tmp/repair_susfs_rejects.py <<'PY'
+          import difflib
+          import pathlib
+          import re
+          import sys
 
-          else
-            echo "Forward patch did not apply."
+          ROOT = pathlib.Path('.')
+          HUNK_RE = re.compile(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@')
 
-            echo "Checking whether it is already applied..."
+          def norm(s: str) -> str:
+              return s.rstrip('\n').rstrip()
 
-            if patch \
-                --dry-run \
-                --batch \
-                --reverse \
-                --fuzz=0 \
-                -p1 < "$PATCH_FILE"
-            then
-              echo "SUSFS kernel patch is already applied."
-            else
-              echo "ERROR: SUSFS 4.19 patch is neither cleanly applicable nor already applied."
-              echo "Stopping before kernel build."
-              exit 1
-            fi
+          def find_all(seq, needle):
+              if not needle or len(needle) > len(seq):
+                  return []
+              out = []
+              n = len(needle)
+              for i in range(0, len(seq) - n + 1):
+                  if seq[i:i+n] == needle:
+                      out.append(i)
+              return out
+
+          def longest_context_run(body):
+              best = []
+              cur = []
+              for line in body:
+                  if line.startswith(' '):
+                      cur.append(line[1:])
+                  else:
+                      if len(cur) > len(best):
+                          best = cur
+                      cur = []
+              if len(cur) > len(best):
+                  best = cur
+              return best
+
+          def parse_reject(path):
+              raw = path.read_text(errors='replace').splitlines(True)
+              hunks = []
+              current = None
+              for line in raw:
+                  m = HUNK_RE.match(line)
+                  if m:
+                      if current is not None:
+                          hunks.append(current)
+                      current = {'header': m.group(0), 'old_start': int(m.group(1)), 'body': []}
+                  elif current is not None:
+                      if line.startswith((' ', '+', '-')):
+                          current['body'].append(line)
+              if current is not None:
+                  hunks.append(current)
+              return hunks
+
+          def apply_hunk(lines, hunk, relpath):
+              body = hunk['body']
+              old_block = [x[1:] for x in body if x.startswith((' ', '-'))]
+              new_block = [x[1:] for x in body if x.startswith((' ', '+'))]
+              removed = any(x.startswith('-') for x in body)
+
+              # Exact old-block match is always preferred.
+              exact = find_all(lines, old_block)
+              if len(exact) == 1:
+                  pos = exact[0]
+                  return lines[:pos] + new_block + lines[pos+len(old_block):]
+              if len(exact) > 1:
+                  raise RuntimeError(f'ambiguous exact match in {relpath}: {hunk["header"]}')
+
+              if not removed:
+                  # Pure insertion hunk: locate the unchanged context and
+                  # preserve the insertion position from the donor hunk.
+                  anchor = longest_context_run(body)
+                  matches = find_all(lines, anchor)
+                  if len(matches) != 1:
+                      raise RuntimeError(f'cannot uniquely locate insertion hunk in {relpath}: {hunk["header"]}')
+
+                  anchor_hit = matches[0]
+                  old_anchor_offset = None
+                  for i in range(len(old_block) - len(anchor) + 1):
+                      if old_block[i:i+len(anchor)] == anchor:
+                          old_anchor_offset = i
+                          break
+                  if old_anchor_offset is None:
+                      raise RuntimeError(f'internal insertion-anchor mismatch in {relpath}: {hunk["header"]}')
+
+                  add_before = 0
+                  seen_add = False
+                  for line in body:
+                      if line.startswith('+'):
+                          seen_add = True
+                          break
+                      if line.startswith(' '):
+                          add_before += 1
+                  pos = anchor_hit - old_anchor_offset + add_before
+                  additions = [line[1:] for line in body if line.startswith('+')]
+                  return lines[:pos] + additions + lines[pos:]
+
+              # For a changed hunk, locate a unique long context run and score
+              # the surrounding candidate against the donor old block.
+              anchor = longest_context_run(body)
+              if len(anchor) < 2:
+                  raise RuntimeError(f'insufficient stable context in {relpath}: {hunk["header"]}')
+
+              anchor_hits = find_all(lines, anchor)
+              if not anchor_hits:
+                  raise RuntimeError(f'anchor not found in {relpath}: {hunk["header"]}')
+
+              # Find the position of the anchor inside the old block.
+              anchor_offset = None
+              for i in range(len(old_block) - len(anchor) + 1):
+                  if old_block[i:i+len(anchor)] == anchor:
+                      anchor_offset = i
+                      break
+              if anchor_offset is None:
+                  raise RuntimeError(f'internal anchor mismatch in {relpath}: {hunk["header"]}')
+
+              candidates = []
+              old_norm = [norm(x) for x in old_block]
+              for hit in anchor_hits:
+                  start = hit - anchor_offset
+                  if start < 0 or start + len(old_block) > len(lines):
+                      continue
+                  cand = [norm(x) for x in lines[start:start+len(old_block)]]
+                  ratio = difflib.SequenceMatcher(a=old_norm, b=cand, autojunk=False).ratio()
+                  candidates.append((ratio, start))
+
+              candidates.sort(reverse=True)
+              if not candidates:
+                  raise RuntimeError(f'no in-range candidate for {relpath}: {hunk["header"]}')
+
+              best_ratio, best_start = candidates[0]
+              second_ratio = candidates[1][0] if len(candidates) > 1 else 0.0
+
+              # High similarity and a meaningful uniqueness margin are required.
+              if best_ratio < 0.78 or (len(candidates) > 1 and best_ratio - second_ratio < 0.05):
+                  raise RuntimeError(
+                      f'ambiguous/weak relocation in {relpath}: {hunk["header"]}; '
+                      f'best={best_ratio:.3f}, second={second_ratio:.3f}'
+                  )
+
+              return lines[:best_start] + new_block + lines[best_start+len(old_block):]
+
+          rejects = sorted(ROOT.rglob('*.rej'))
+          rejects = [p for p in rejects if '.git' not in p.parts]
+          if not rejects:
+              print('No rejected hunks remain after first-pass patching.')
+              sys.exit(0)
+
+          for rej in rejects:
+              target = pathlib.Path(str(rej)[:-4])
+              if not target.exists():
+                  raise RuntimeError(f'reject target does not exist: {target}')
+
+              lines = target.read_text(errors='replace').splitlines(True)
+              hunks = parse_reject(rej)
+              if not hunks:
+                  raise RuntimeError(f'could not parse reject file: {rej}')
+
+              # Work backwards so line positions remain stable.
+              for hunk in sorted(hunks, key=lambda x: x['old_start'], reverse=True):
+                  lines = apply_hunk(lines, hunk, str(target))
+
+              target.write_text(''.join(lines))
+              rej.unlink()
+              print(f'Repaired {target} from {rej.name}')
+
+          remaining = sorted(ROOT.rglob('*.rej'))
+          remaining = [p for p in remaining if '.git' not in p.parts]
+          if remaining:
+              raise RuntimeError('unresolved .rej files remain:\n' + '\n'.join(map(str, remaining)))
+          print('All SUSFS rejected hunks were repaired unambiguously.')
+          PY
+
+          python3 /tmp/repair_susfs_rejects.py
+
+          if find . -type f -name '*.rej' -not -path './.git/*' | grep -q .; then
+            echo 'ERROR: unresolved SUSFS reject files remain.'
+            exit 1
           fi
 
-          test -f fs/susfs.c
-          test -f fs/sus_su.c
-          test -f include/linux/susfs.h
-          test -f include/linux/sus_su.h
+          # Keep the source tree clean from patch backup files after success.
+          find . -type f -name '*.orig' -not -path './.git/*' -delete || true
 
-          echo "SUSFS kernel patch stage passed."
+          echo "SUSFS source adaptation complete."
 
       # ============================================================
-      # 10. MANUAL KERNELSU HOOKS
-      #
-      # Required for legacy 4.19.
-      # KPROBES remain disabled.
+      # 10. KERNELSU MANUAL SYSCALL HOOKS
       # ============================================================
       - name: Apply KernelSU manual hooks
         shell: bash
@@ -387,82 +465,65 @@ jobs:
             -o /tmp/syscall_hook.sh
 
           test -s /tmp/syscall_hook.sh
-
           chmod +x /tmp/syscall_hook.sh
-
           bash /tmp/syscall_hook.sh
 
-          echo "Checking manual hooks..."
-
-          grep -q "ksu_handle_execveat" \
-            fs/exec.c
-
-          grep -q "ksu_handle_faccessat" \
-            fs/open.c
-
-          grep -q "ksu_handle_sys_read" \
-            fs/read_write.c
-
-          grep -q "ksu_handle_stat" \
-            fs/stat.c
-
-          grep -q "ksu_handle_sys_reboot" \
-            kernel/reboot.c
-
-          grep -q "ksu_handle_setresuid" \
-            kernel/sys.c
+          grep -q 'ksu_handle_execveat' fs/exec.c
+          grep -q 'ksu_handle_faccessat' fs/open.c
+          grep -q 'ksu_handle_sys_read' fs/read_write.c
+          grep -q 'ksu_handle_stat' fs/stat.c
+          grep -q 'ksu_handle_sys_reboot' kernel/reboot.c
+          grep -q 'ksu_handle_setresuid' kernel/sys.c
 
           echo "KernelSU manual hooks verified."
 
       # ============================================================
-      # 11. PRE-BUILD SOURCE VERIFICATION
+      # 11. STRICT SOURCE-LEVEL SUSFS VERIFICATION
       # ============================================================
-      - name: Verify KernelSU and SUSFS integration
+      - name: Verify A135F SUSFS integration
         shell: bash
         working-directory: kernel
         run: |
           set -euxo pipefail
 
           echo "========== Kernel =========="
-          make kernelversion
+          test "$(make kernelversion)" = "4.19.325"
 
           echo "========== KernelSU =========="
-
           test -L drivers/kernelsu
           test -f drivers/kernelsu/Kconfig
           test -f drivers/kernelsu/Makefile
           test -f drivers/kernelsu/ksu.c
           test -f drivers/kernelsu/core_hook.c
+          grep -q 'config KSU_SUSFS' drivers/kernelsu/Kconfig
+          grep -q '#include <linux/susfs.h>' drivers/kernelsu/core_hook.c
 
-          echo "========== SUSFS =========="
-
+          echo "========== SUSFS source files =========="
           test -f fs/susfs.c
           test -f fs/sus_su.c
           test -f include/linux/susfs.h
+          test -f include/linux/susfs_def.h
           test -f include/linux/sus_su.h
+          grep -q '^#define SUSFS_VERSION' include/linux/susfs.h
+          grep -q '#include "susfs_def.h"' include/linux/susfs.h
 
-          grep -q "config KSU_SUSFS" \
-            drivers/kernelsu/Kconfig
+          echo "========== SUSFS integration anchors =========="
+          grep -q 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' fs/Makefile
+          grep -q 'INODE_STATE_SUS_PATH' fs/dcache.c
+          grep -q 'INODE_STATE_SUS_PATH' fs/namei.c
+          grep -q 'SUS_MOUNT' fs/namespace.c
+          grep -q 'susfs_task' fs/proc/fd.c
+          grep -q 'susfs' fs/proc_namespace.c
+          grep -q 'susfs' fs/readdir.c
+          grep -q 'susfs' fs/stat.c
+          grep -q 'susfs' fs/statfs.c
+          grep -q 'susfs' include/linux/mount.h
+          grep -q 'susfs' include/linux/sched.h
+          grep -q 'susfs' kernel/compat.c || true
+          grep -q 'susfs' kernel/kallsyms.c || true
+          grep -q 'susfs' kernel/sys.c
 
-          grep -q "#include <linux/susfs.h>" \
-            drivers/kernelsu/core_hook.c
-
-          echo "========== SUSFS version =========="
-
-          grep -E '^#define SUSFS_VERSION' \
-            include/linux/susfs.h
-
-          echo "========== Manual hooks =========="
-
-          grep -R "ksu_handle_" \
-            fs/exec.c \
-            fs/open.c \
-            fs/read_write.c \
-            fs/stat.c \
-            kernel/reboot.c \
-            kernel/sys.c
-
-          echo "All source-level checks passed."
+          echo "All required source-level SUSFS anchors passed."
 
       # ============================================================
       # 12. CONFIGURE KERNEL
@@ -476,10 +537,7 @@ jobs:
           rm -rf out
           mkdir -p out
 
-          make \
-            O=out \
-            ARCH=arm64 \
-            "$DEFCONFIG"
+          make O=out ARCH=arm64 "$DEFCONFIG"
 
           ./scripts/config --file out/.config \
             --enable CONFIG_KSU \
@@ -490,7 +548,7 @@ jobs:
             --enable CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
             --enable CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
             --enable CONFIG_KSU_SUSFS_SUS_KSTAT \
-            --enable CONFIG_KSU_SUSFS_SUS_OVERLAYFS \
+            --disable CONFIG_KSU_SUSFS_SUS_OVERLAYFS \
             --enable CONFIG_KSU_SUSFS_TRY_UMOUNT \
             --enable CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
             --enable CONFIG_KSU_SUSFS_SPOOF_UNAME \
@@ -509,44 +567,26 @@ jobs:
             --disable CONFIG_LOCALVERSION_AUTO \
             --set-str CONFIG_LOCALVERSION "$KERNEL_LOCALVERSION"
 
-          make \
-            O=out \
-            ARCH=arm64 \
-            olddefconfig
+          make O=out ARCH=arm64 olddefconfig
 
-          echo "========== Final KSU config =========="
-
+          echo "========== Final config =========="
           grep -E \
             'CONFIG_KSU(=|_)|CONFIG_KPROBES|CONFIG_KPROBE_EVENTS|CONFIG_OVERLAY_FS|CONFIG_LTO|CONFIG_WERROR|CONFIG_LOCALVERSION' \
             out/.config || true
 
-          echo "========== Required values =========="
-
-          grep -q '^CONFIG_KSU=y$' \
-            out/.config
-
-          grep -q '^CONFIG_KSU_SUSFS=y$' \
-            out/.config
-
-          grep -q '^CONFIG_OVERLAY_FS=y$' \
-            out/.config
-
-          grep -q '^# CONFIG_KPROBES is not set$' \
-            out/.config
-
-          grep -q '^# CONFIG_KPROBE_EVENTS is not set$' \
-            out/.config
-
-          grep -q '^CONFIG_LOCALVERSION="-MAX-ARAF"$' \
-            out/.config
+          # Mandatory configuration checks.
+          grep -q '^CONFIG_KSU=y$' out/.config
+          grep -q '^CONFIG_KSU_SUSFS=y$' out/.config
+          grep -q '^CONFIG_OVERLAY_FS=y$' out/.config
+          grep -q '^# CONFIG_KPROBES is not set$' out/.config
+          grep -q '^# CONFIG_KPROBE_EVENTS is not set$' out/.config
+          grep -q '^# CONFIG_KSU_SUSFS_SUS_OVERLAYFS is not set$' out/.config
+          grep -q '^CONFIG_LOCALVERSION="-MAX-ARAF"$' out/.config
 
           echo "Kernel configuration passed."
 
       # ============================================================
       # 13. BUILD KERNEL
-      #
-      # Host tools use Ubuntu GCC.
-      # Target kernel uses Android LLVM.
       # ============================================================
       - name: Build kernel
         shell: bash
@@ -558,13 +598,8 @@ jobs:
         run: |
           set -euxo pipefail
 
-          echo "Compiler:"
           "$LLVM_HOME/bin/clang" --version
-
-          echo "Linker:"
           "$LLVM_HOME/bin/ld.lld" --version
-
-          echo "Starting kernel build..."
 
           make \
             O=out \
@@ -582,39 +617,42 @@ jobs:
             HOSTCC=/usr/bin/gcc \
             HOSTCXX=/usr/bin/g++ \
             HOSTAR=/usr/bin/ar \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
             KCFLAGS="-Wno-error=strict-prototypes" \
             -j2 \
             Image.gz
 
-          echo "Kernel build command completed."
+          test -s out/arch/arm64/boot/Image.gz
+          test -s out/arch/arm64/boot/Image
 
       # ============================================================
       # 14. VERIFY BUILT KERNEL
       # ============================================================
-      - name: Verify kernel image
+      - name: Verify kernel image and vmlinux
         shell: bash
         working-directory: kernel
         run: |
           set -euxo pipefail
 
-          test -f out/arch/arm64/boot/Image.gz
+          test -s out/arch/arm64/boot/Image
           test -s out/arch/arm64/boot/Image.gz
+          test -s out/vmlinux
 
           echo "Image.gz:"
           ls -lh out/arch/arm64/boot/Image.gz
 
-          echo "Searching for DTB outputs..."
+          echo "vmlinux:"
+          ls -lh out/vmlinux
 
-          find out/arch/arm64/boot \
-            -type f \
-            \( -name "*.dtb" -o -name "Image.gz-dtb" \) \
-            -print || true
+          echo "Checking built vmlinux for KSU/SUSFS strings..."
+          strings out/vmlinux | grep -E 'KernelSU|SUSFS|susfs' | head -n 40 || true
 
-          echo "Kernel image verification passed."
+          # The workflow intentionally does NOT rely on kallsyms here because
+          # CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS is enabled.
+          grep -q 'CONFIG_KSU=y' out/.config
+          grep -q 'CONFIG_KSU_SUSFS=y' out/.config
 
       # ============================================================
-      # 15. BUILD ANYKERNEL3 PACKAGE
+      # 15. PACKAGE ANYKERNEL3
       # ============================================================
       - name: Package AnyKernel3
         shell: bash
@@ -623,70 +661,39 @@ jobs:
           set -euxo pipefail
 
           rm -rf AnyKernel3
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
 
-          git clone \
-            --depth=1 \
-            https://github.com/osm0sis/AnyKernel3.git \
-            AnyKernel3
-
-          cp \
-            out/arch/arm64/boot/Image.gz \
-            AnyKernel3/Image.gz
-
+          cp out/arch/arm64/boot/Image.gz AnyKernel3/Image.gz
           test -s AnyKernel3/Image.gz
 
           cd AnyKernel3
 
-          # A135F is a non-A/B boot partition.
-          # Device check is disabled deliberately because the current
-          # ROM is a port and ro.product.device can vary.
-          sed -i \
-            's/^do.devicecheck=.*/do.devicecheck=0/' \
-            anykernel.sh
-
-          sed -i \
-            's/^do.modules=.*/do.modules=0/' \
-            anykernel.sh
-
-          sed -i \
-            's/^do.systemless=.*/do.systemless=0/' \
-            anykernel.sh
-
-          sed -i \
-            's/^is_slot_device=.*/is_slot_device=0;/' \
-            anykernel.sh
-
-          sed -i \
-            's|^block=.*|block=/dev/block/bootdevice/by-name/boot;|' \
-            anykernel.sh
-
-          sed -i \
-            's/^kernel.string=.*/kernel.string=MAX ARAF KernelSU-Next + SUSFS 4.19.325/' \
-            anykernel.sh
-
-          echo "========== AnyKernel configuration =========="
+          # This device is non-A/B and the user-confirmed boot by-name path
+          # is /dev/block/by-name/boot. Device checks stay disabled because
+          # this build is intended for the user's SM-A135F port-ROM setup.
+          sed -i 's/^do.devicecheck=.*/do.devicecheck=0/' anykernel.sh
+          sed -i 's/^do.modules=.*/do.modules=0/' anykernel.sh
+          sed -i 's/^do.systemless=.*/do.systemless=0/' anykernel.sh
+          sed -i 's/^is_slot_device=.*/is_slot_device=0;/' anykernel.sh
+          sed -i 's|^block=.*|block=/dev/block/by-name/boot;|' anykernel.sh
+          sed -i 's/^kernel.string=.*/kernel.string=MAX ARAF KernelSU-Next + SUSFS 4.19.325/' anykernel.sh
 
           grep -E \
             'kernel.string|do.devicecheck|do.modules|do.systemless|block=|is_slot_device' \
             anykernel.sh
 
-          echo "Building flashable ZIP..."
-
           zip -r9 \
             ../A135F-KSU-Next-SUSFS-MAX-ARAF.zip \
             . \
-            -x ".git/*" \
-            -x ".github/*"
+            -x '.git/*' \
+            -x '.github/*'
 
           cd ..
-
           test -s A135F-KSU-Next-SUSFS-MAX-ARAF.zip
-
-          echo "AnyKernel3 package:"
           ls -lh A135F-KSU-Next-SUSFS-MAX-ARAF.zip
 
       # ============================================================
-      # 16. SAVE ARTIFACTS
+      # 16. UPLOAD BUILD ARTIFACTS
       # ============================================================
       - name: Upload kernel artifacts
         uses: actions/upload-artifact@v4
@@ -695,11 +702,60 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           path: |
+            kernel/out/arch/arm64/boot/Image
             kernel/out/arch/arm64/boot/Image.gz
+            kernel/out/vmlinux
             kernel/A135F-KSU-Next-SUSFS-MAX-ARAF.zip
 
       # ============================================================
-      # 17. FINAL SUMMARY
+      # 17. ALWAYS SAVE SUSFS PATCH DIAGNOSTICS
+      # ============================================================
+      - name: Save SUSFS patch diagnostics
+        if: always()
+        shell: bash
+        working-directory: kernel
+        run: |
+          set +e
+          mkdir -p diagnostics
+
+          echo '=== Git status ===' > diagnostics/git-status.txt
+          git status --short >> diagnostics/git-status.txt 2>&1
+
+          echo '=== Diff stat ===' > diagnostics/diff-stat.txt
+          git diff --stat >> diagnostics/diff-stat.txt 2>&1
+
+          echo '=== Remaining reject files ===' > diagnostics/rejects.txt
+          find . -type f -name '*.rej' -not -path './.git/*' -print >> diagnostics/rejects.txt 2>&1
+
+          echo '=== Remaining orig files ===' > diagnostics/orig.txt
+          find . -type f -name '*.orig' -not -path './.git/*' -print >> diagnostics/orig.txt 2>&1
+
+          echo '=== Critical integration grep ===' > diagnostics/integration-grep.txt
+          grep -nE 'SUSFS|susfs|INODE_STATE_SUS_PATH|susfs_task|susfs_mnt' \
+            fs/Makefile fs/dcache.c fs/namei.c fs/namespace.c fs/proc/fd.c \
+            fs/proc_namespace.c fs/readdir.c fs/stat.c fs/statfs.c \
+            include/linux/mount.h include/linux/sched.h kernel/sys.c \
+            2>/dev/null >> diagnostics/integration-grep.txt
+
+          echo '=== Reject contents (if any) ===' > diagnostics/reject-contents.txt
+          while IFS= read -r f; do
+            echo "----- $f -----" >> diagnostics/reject-contents.txt
+            cat "$f" >> diagnostics/reject-contents.txt
+          done < <(find . -type f -name '*.rej' -not -path './.git/*' -print)
+
+          ls -lh diagnostics || true
+
+      - name: Upload SUSFS diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: A135F-SUSFS-diagnostics
+          if-no-files-found: warn
+          compression-level: 6
+          path: kernel/diagnostics
+
+      # ============================================================
+      # 18. FINAL SUMMARY
       # ============================================================
       - name: Build summary
         shell: bash
@@ -707,29 +763,29 @@ jobs:
         run: |
           set -euxo pipefail
 
-          echo "=============================================="
-          echo "       MAX ARAF A135F KERNEL BUILD"
-          echo "=============================================="
+          echo '=============================================='
+          echo '      MAX ARAF A135F KERNEL BUILD'
+          echo '=============================================='
           echo
-          echo "Kernel:"
+          echo 'Kernel:'
           make kernelversion
           echo
-          echo "KernelSU:"
+          echo 'KernelSU:'
           grep '^CONFIG_KSU=y$' out/.config
           echo
-          echo "SUSFS:"
+          echo 'SUSFS:'
           grep '^CONFIG_KSU_SUSFS=y$' out/.config
           grep -E '^#define SUSFS_VERSION' include/linux/susfs.h
           echo
-          echo "Localversion:"
+          echo 'Localversion:'
           grep '^CONFIG_LOCALVERSION=' out/.config
           echo
-          echo "Kernel image:"
+          echo 'Kernel image:'
           ls -lh out/arch/arm64/boot/Image.gz
           echo
-          echo "AnyKernel3:"
+          echo 'AnyKernel3:'
           ls -lh A135F-KSU-Next-SUSFS-MAX-ARAF.zip
           echo
-          echo "=============================================="
-          echo "              BUILD SUCCESS"
-          echo "=============================================="
+          echo '=============================================='
+          echo '             BUILD SUCCESS'
+          echo '=============================================='
