@@ -90,59 +90,84 @@ jobs:
       # 4. Setup Android Clang
       # ============================================================
       - name: Setup Android Clang
+        shell: bash
         run: |
           set -euxo pipefail
 
           TOOLCHAIN="$HOME/android-clang"
-          ARCHIVE="$RUNNER_TEMP/clang.tar.gz"
+          ARCHIVE="$RUNNER_TEMP/clang-r450784e.tar.gz"
 
           rm -rf "$TOOLCHAIN"
           mkdir -p "$TOOLCHAIN"
 
-          echo "Downloading Android Clang..."
+          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android13-release/clang-r450784e.tar.gz"
 
-          for i in 1 2 3 4 5; do
-            if curl -L --fail --retry 5 --retry-delay 5 \
-              "$CLANG_URL" \
+          echo "Downloading official Android clang-r450784e..."
+          echo "$URL"
+
+          success=0
+
+          for i in 1 2 3 4 5 6 7 8; do
+            echo "Download attempt $i..."
+
+            rm -f "$ARCHIVE"
+
+            if curl -L \
+              --fail \
+              --connect-timeout 30 \
+              --max-time 900 \
+              --retry 3 \
+              --retry-delay 10 \
+              "$URL" \
               -o "$ARCHIVE"; then
+
+              success=1
               break
             fi
 
-            echo "Clang download attempt $i failed."
-            sleep 10
+            echo "Attempt $i failed. Waiting..."
+            sleep 15
           done
+
+          if [ "$success" -ne 1 ]; then
+            echo "ERROR: Unable to download Android clang-r450784e"
+            exit 1
+          fi
 
           test -s "$ARCHIVE"
 
-          echo "Extracting Clang..."
+          echo "Extracting clang..."
           tar -xzf "$ARCHIVE" -C "$TOOLCHAIN"
 
-          test -x "$TOOLCHAIN/bin/clang"
+          echo "Checking clang..."
+
+                    test -x "$TOOLCHAIN/bin/clang"
           test -x "$TOOLCHAIN/bin/ld.lld"
 
-          echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
-
           echo "LLVM_HOME=$TOOLCHAIN" >> "$GITHUB_ENV"
+          echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
 
           "$TOOLCHAIN/bin/clang" --version
           "$TOOLCHAIN/bin/ld.lld" --version
+
+          echo "Android clang-r450784e ready."
 
 
       # ============================================================
       # 5. Verify toolchain
       # ============================================================
       - name: Verify toolchain
+        shell: bash
         run: |
           set -eux
 
-          which clang
-          which ld.lld
-
-          clang --version
-          ld.lld --version
-
           test -x "$LLVM_HOME/bin/clang"
           test -x "$LLVM_HOME/bin/ld.lld"
+
+          "$LLVM_HOME/bin/clang" --version
+          "$LLVM_HOME/bin/ld.lld" --version
+
+          echo "Clang verification passed."
 
 
       # ============================================================
