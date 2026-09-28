@@ -239,13 +239,9 @@ jobs:
       # ============================================================
       # 9. SMART SUSFS ADAPTATION
       #
-      # The donor SUSFS 4.19 patch was written for a different 4.19
-      # tree. A135F's Samsung VFS files are not identical. Therefore:
-      #   1) apply what matches normally with limited context drift;
-      #   2) repair only rejected hunks when the old block/context can
-      #      be located uniquely;
-      #   3) abort on an ambiguous/unmatched hunk;
-      #   4) never use --force and never silently ignore .rej files.
+      # The donor SUSFS 4.19 patch targets a different 4.19 VFS tree.
+      # A135F's namespace.c must NOT receive the donor namespace hunks;
+      # those three call-sites are adapted structurally below.
       # ============================================================
       - name: Adapt SUSFS patch to A135F 4.19.325
         shell: bash
@@ -259,31 +255,20 @@ jobs:
           rm -f -- ./*.rej ./*.orig
           find . -type f \( -name '*.rej' -o -name '*.orig' \) -not -path './.git/*' -delete || true
 
-          # First pass: modest context drift is okay; large/ambiguous drift is not.
-          python3 - "$PATCH_FILE" <<'PY'
-          import re
-          import sys
-          from pathlib import Path
+          # Build a patch that EXCLUDES fs/namespace.c.
+          # Use the actual unified-diff header as the state boundary.
+          awk '
+            /^diff --git / {
+              keep = ($0 !~ /^diff --git a\/fs\/namespace\.c b\/fs\/namespace\.c([[:space:]]|$)/)
+            }
+            keep { print }
+          ' "$PATCH_FILE" > /tmp/susfs-no-namespace.patch
 
-          patch_path = Path(sys.argv[1])
-          raw = patch_path.read_text()
-
-          # GNU patch does not support --exclude=... . Build a temporary
-          # patch with only the fs/namespace.c diff removed; namespace.c
-          # is adapted structurally below.
-          parts = re.split(r'(?m)^diff --git ', raw)
-          kept = []
-          for part in parts:
-              if not part.strip():
-                  continue
-              if re.search(r'(?m)^a/fs/namespace\.c\s+b/fs/namespace\.c$', part):
-                  continue
-              kept.append("diff --git " + part)
-
-          Path("/tmp/susfs-no-namespace.patch").write_text(
-              "".join(kept)
-          )
-          PY
+          test -s /tmp/susfs-no-namespace.patch
+          if grep -q '^diff --git a/fs/namespace\.c b/fs/namespace\.c' /tmp/susfs-no-namespace.patch; then
+            echo "ERROR: fs/namespace.c was not excluded from SUSFS patch"
+            exit 1
+          fi
 
           patch --batch --forward -F3 -p1 < /tmp/susfs-no-namespace.patch || true
 
@@ -291,27 +276,20 @@ jobs:
           import difflib
           import pathlib
           import re
-          import sys
 
           ROOT = pathlib.Path('.')
           HUNK_RE = re.compile(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@')
 
-          def norm(s: str) -> str:
+          def norm(s):
               return s.rstrip('\n').rstrip()
 
           def find_all(seq, needle):
               if not needle or len(needle) > len(seq):
                   return []
-              out = []
-              n = len(needle)
-              for i in range(0, len(seq) - n + 1):
-                  if seq[i:i+n] == needle:
-                      out.append(i)
-              return out
+              return [i for i in range(len(seq)-len(needle)+1) if seq[i:i+len(needle)] == needle]
 
           def longest_context_run(body):
-              best = []
-              cur = []
+              best, cur = [], []
               for line in body:
                   if line.startswith(' '):
                       cur.append(line[1:])
@@ -319,23 +297,18 @@ jobs:
                       if len(cur) > len(best):
                           best = cur
                       cur = []
-              if len(cur) > len(best):
-                  best = cur
-              return best
+              return max(best, cur, key=len)
 
           def parse_reject(path):
-              raw = path.read_text(errors='replace').splitlines(True)
-              hunks = []
-              current = None
-              for line in raw:
+              hunks, current = [], None
+              for line in path.read_text(errors='replace').splitlines(True):
                   m = HUNK_RE.match(line)
                   if m:
                       if current is not None:
                           hunks.append(current)
-                      current = {'header': m.group(0), 'old_start': int(m.group(1)), 'body': []}
-                  elif current is not None:
-                      if line.startswith((' ', '+', '-')):
-                          current['body'].append(line)
+                      current = {'header':m.group(0), 'old_start':int(m.group(1)), 'body':[]}
+                  elif current is not None and line.startswith((' ', '+', '-')):
+                      current['body'].append(line)
               if current is not None:
                   hunks.append(current)
               return hunks
@@ -346,216 +319,128 @@ jobs:
               new_block = [x[1:] for x in body if x.startswith((' ', '+'))]
               removed = any(x.startswith('-') for x in body)
 
-              # Exact old-block match is always preferred.
               exact = find_all(lines, old_block)
               if len(exact) == 1:
-                  pos = exact[0]
-                  return lines[:pos] + new_block + lines[pos+len(old_block):]
+                  p = exact[0]
+                  return lines[:p] + new_block + lines[p+len(old_block):]
               if len(exact) > 1:
                   raise RuntimeError(f'ambiguous exact match in {relpath}: {hunk["header"]}')
 
-              if not removed:
-                  # Pure insertion hunk: locate the unchanged context and
-                  # preserve the insertion position from the donor hunk.
-                  anchor = longest_context_run(body)
-                  matches = find_all(lines, anchor)
-                  if len(matches) != 1:
-                      raise RuntimeError(f'cannot uniquely locate insertion hunk in {relpath}: {hunk["header"]}')
-
-                  anchor_hit = matches[0]
-                  old_anchor_offset = None
-                  for i in range(len(old_block) - len(anchor) + 1):
-                      if old_block[i:i+len(anchor)] == anchor:
-                          old_anchor_offset = i
-                          break
-                  if old_anchor_offset is None:
-                      raise RuntimeError(f'internal insertion-anchor mismatch in {relpath}: {hunk["header"]}')
-
-                  add_before = 0
-                  seen_add = False
-                  for line in body:
-                      if line.startswith('+'):
-                          seen_add = True
-                          break
-                      if line.startswith(' '):
-                          add_before += 1
-                  pos = anchor_hit - old_anchor_offset + add_before
-                  additions = [line[1:] for line in body if line.startswith('+')]
-                  return lines[:pos] + additions + lines[pos:]
-
-              # For a changed hunk, locate a unique long context run and score
-              # the surrounding candidate against the donor old block.
               anchor = longest_context_run(body)
               if len(anchor) < 2:
                   raise RuntimeError(f'insufficient stable context in {relpath}: {hunk["header"]}')
-
-              anchor_hits = find_all(lines, anchor)
-              if not anchor_hits:
+              hits = find_all(lines, anchor)
+              if not hits:
                   raise RuntimeError(f'anchor not found in {relpath}: {hunk["header"]}')
 
-              # Find the position of the anchor inside the old block.
-              anchor_offset = None
-              for i in range(len(old_block) - len(anchor) + 1):
+              offset = None
+              for i in range(len(old_block)-len(anchor)+1):
                   if old_block[i:i+len(anchor)] == anchor:
-                      anchor_offset = i
+                      offset = i
                       break
-              if anchor_offset is None:
+              if offset is None:
                   raise RuntimeError(f'internal anchor mismatch in {relpath}: {hunk["header"]}')
 
-              candidates = []
-              old_norm = [norm(x) for x in old_block]
-              for hit in anchor_hits:
-                  start = hit - anchor_offset
-                  if start < 0 or start + len(old_block) > len(lines):
-                      continue
-                  cand = [norm(x) for x in lines[start:start+len(old_block)]]
-                  ratio = difflib.SequenceMatcher(a=old_norm, b=cand, autojunk=False).ratio()
-                  candidates.append((ratio, start))
+              if not removed:
+                  if len(hits) != 1:
+                      raise RuntimeError(f'ambiguous insertion in {relpath}: {hunk["header"]}')
+                  pos = hits[0] - offset
+                  additions = [x[1:] for x in body if x.startswith('+')]
+                  return lines[:pos] + additions + lines[pos:]
 
+              candidates=[]
+              old_norm=[norm(x) for x in old_block]
+              for hit in hits:
+                  st=hit-offset
+                  if st < 0 or st+len(old_block)>len(lines):
+                      continue
+                  cand=[norm(x) for x in lines[st:st+len(old_block)]]
+                  ratio=difflib.SequenceMatcher(a=old_norm,b=cand,autojunk=False).ratio()
+                  candidates.append((ratio,st))
               candidates.sort(reverse=True)
               if not candidates:
                   raise RuntimeError(f'no in-range candidate for {relpath}: {hunk["header"]}')
+              best, st = candidates[0]
+              second = candidates[1][0] if len(candidates)>1 else 0.0
+              if best < 0.78 or (len(candidates)>1 and best-second < 0.05):
+                  raise RuntimeError(f'ambiguous/weak relocation in {relpath}: {hunk["header"]}; best={best:.3f}, second={second:.3f}')
+              return lines[:st] + new_block + lines[st+len(old_block):]
 
-              best_ratio, best_start = candidates[0]
-              second_ratio = candidates[1][0] if len(candidates) > 1 else 0.0
-
-              # High similarity and a meaningful uniqueness margin are required.
-              if best_ratio < 0.78 or (len(candidates) > 1 and best_ratio - second_ratio < 0.05):
-                  raise RuntimeError(
-                      f'ambiguous/weak relocation in {relpath}: {hunk["header"]}; '
-                      f'best={best_ratio:.3f}, second={second_ratio:.3f}'
-                  )
-
-              return lines[:best_start] + new_block + lines[best_start+len(old_block):]
-
-          rejects = sorted(ROOT.rglob('*.rej'))
-          rejects = [p for p in rejects if '.git' not in p.parts]
+          rejects=[p for p in sorted(ROOT.rglob('*.rej')) if '.git' not in p.parts]
           if not rejects:
-              print('No rejected hunks remain after first-pass patching.')
-              sys.exit(0)
+              print('No rejected non-namespace hunks remain after first-pass patching.')
+              raise SystemExit(0)
 
           for rej in rejects:
-              target = pathlib.Path(str(rej)[:-4])
-              if not target.exists():
-                  raise RuntimeError(f'reject target does not exist: {target}')
-
-              lines = target.read_text(errors='replace').splitlines(True)
-              hunks = parse_reject(rej)
-              if not hunks:
-                  raise RuntimeError(f'could not parse reject file: {rej}')
-
-              # Work backwards so line positions remain stable.
-              for hunk in sorted(hunks, key=lambda x: x['old_start'], reverse=True):
-                  lines = apply_hunk(lines, hunk, str(target))
-
+              target=pathlib.Path(str(rej)[:-4])
+              lines=target.read_text(errors='replace').splitlines(True)
+              hunks=parse_reject(rej)
+              for hunk in sorted(hunks,key=lambda x:x['old_start'],reverse=True):
+                  lines=apply_hunk(lines,hunk,str(target))
               target.write_text(''.join(lines))
               rej.unlink()
               print(f'Repaired {target} from {rej.name}')
 
-          remaining = sorted(ROOT.rglob('*.rej'))
-          remaining = [p for p in remaining if '.git' not in p.parts]
+          remaining=[p for p in sorted(ROOT.rglob('*.rej')) if '.git' not in p.parts]
           if remaining:
-              raise RuntimeError('unresolved .rej files remain:\n' + '\n'.join(map(str, remaining)))
-          print('All SUSFS rejected hunks were repaired unambiguously.')
+              raise RuntimeError('unresolved .rej files remain:\n'+'\n'.join(map(str,remaining)))
+          print('All SUSFS non-namespace rejected hunks were repaired unambiguously.')
           PY
 
           python3 /tmp/repair_susfs_rejects.py
-
-          if find . -type f -name '*.rej' -not -path './.git/*' | grep -q .; then
-            echo 'ERROR: unresolved SUSFS reject files remain.'
-            exit 1
-          fi
-
-          # Keep the source tree clean from patch backup files after success.
           find . -type f -name '*.orig' -not -path './.git/*' -delete || true
 
-          echo "SUSFS non-namespace source adaptation complete."
-
+          # Structural fs/namespace.c adaptation on the CLEAN namespace.c.
           python3 - <<'PY'
           from pathlib import Path
           import re
 
-          path = Path("fs/namespace.c")
+          path = Path('fs/namespace.c')
           src = path.read_text()
 
           def function_body(text, name):
-              # Find the actual C function definition, not a call/prototype.
-              for m in re.finditer(r"\b" + re.escape(name) + r"\s*\(", text):
-                  pos = m.end() - 1
+              for m in re.finditer(r'\b' + re.escape(name) + r'\s*\(', text):
+                  pos = m.end()-1
                   depth = 0
                   i = pos
-
                   while i < len(text):
-                      if text[i] == "(":
+                      if text[i] == '(':
                           depth += 1
-                      elif text[i] == ")":
+                      elif text[i] == ')':
                           depth -= 1
                           if depth == 0:
                               break
                       i += 1
-
-                  if i >= len(text):
-                      continue
-
-                  j = i + 1
+                  j = i+1
                   while j < len(text) and text[j].isspace():
                       j += 1
-
-                  # A real definition has an opening brace after the
-                  # argument list; calls/prototypes do not.
-                  if j >= len(text) or text[j] != "{":
+                  if j >= len(text) or text[j] != '{':
                       continue
-
-                  brace = j
-                  depth = 0
-                  for k in range(brace, len(text)):
-                      if text[k] == "{":
+                  depth=0
+                  for k in range(j,len(text)):
+                      if text[k]=='{':
                           depth += 1
-                      elif text[k] == "}":
+                      elif text[k]=='}':
                           depth -= 1
-                          if depth == 0:
-                              return m.start(), k + 1, text[m.start():k + 1]
+                          if depth==0:
+                              return m.start(),k+1,text[m.start():k+1]
+              raise SystemExit(f'Function definition not found: {name}')
 
-              raise SystemExit(f"Function definition not found: {name}")
-
-          def insert_after_anchor(text, name, anchors, block, label):
-              start, end, body = function_body(text, name)
-
+          def insert_once(text, name, anchor, block):
+              start,end,body=function_body(text,name)
               if block.strip() in body:
                   return text
-
-              for needle in anchors:
-                  if body.count(needle) == 1:
-                      pos = body.find(needle) + len(needle)
-                      new_body = body[:pos] + block + body[pos:]
-                      return text[:start] + new_body + text[end:]
-
-              # Whitespace-tolerant fallback for the same C statement.
-              for needle in anchors:
-                  if needle in (
-                      "mnt->mnt_parent = mnt;",
-                      "mnt->mnt.mnt_parent = mnt;",
-                  ):
-                      pat = re.compile(
-                          r"mnt\s*->\s*mnt_parent\s*=\s*mnt\s*;"
-                      )
-                      matches = list(pat.finditer(body))
-                      if len(matches) == 1:
-                          pos = matches[0].end()
-                          new_body = body[:pos] + block + body[pos:]
-                          return text[:start] + new_body + text[end:]
-
-              raise SystemExit(
-                  f"{label}: none of the expected anchors were found: "
-                  + ", ".join(repr(x) for x in anchors)
-              )
+              hits=list(re.finditer(anchor,body))
+              if len(hits)!=1:
+                  raise SystemExit(f'{name}: expected exactly one anchor match, found {len(hits)}')
+              p=hits[0].end()
+              return text[:start] + body[:p] + block + body[p:] + text[end:]
 
           vfs_block = r'''
           #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
               /* SUSFS: reorder mounts created by zygote. */
               if (likely(current->android_kabi_reserved3 & 1)) {
-                  mnt->mnt.android_kabi_reserved1 =
-                      current->android_kabi_reserved4++;
+                  mnt->mnt.android_kabi_reserved1 = current->android_kabi_reserved4++;
               }
           #endif
           '''
@@ -564,112 +449,61 @@ jobs:
           #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
               /* SUSFS: reorder mounts created by zygote. */
               if (likely(current->android_kabi_reserved3 & 1)) {
-                  mnt->mnt.android_kabi_reserved1 =
-                      current->android_kabi_reserved4++;
+                  mnt->mnt.android_kabi_reserved1 = current->android_kabi_reserved4++;
               }
-
               /* Keep SUSFS mounts private when cloned. */
-              if (unlikely(
-                      mnt->mnt.mnt_root->d_inode->i_state & 33554432)) {
-                  flag &= (~CL_SLAVE | ~CL_SHARED_TO_SLAVE |
-                           ~CL_MAKE_SHARED | CL_PRIVATE);
+              if (unlikely(mnt->mnt.mnt_root->d_inode->i_state & 33554432)) {
+                  flag &= (~CL_SLAVE | ~CL_SHARED_TO_SLAVE | ~CL_MAKE_SHARED | CL_PRIVATE);
               }
           #endif
           '''
 
           copy_block = r'''
           #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-              /*
-               * Assign fake mount ids to the namespace copied from zygote.
-               */
+              /* Assign fake mount ids to the namespace copied from zygote. */
               {
                   int first_entry_mnt_id = 0;
                   int first_entry_mnt_master_group_id = 1;
                   int last_mnt_master_group_id = 0;
-
                   if (likely(current->android_kabi_reserved3 & 1)) {
-                      first_entry_mnt_id =
-                          list_first_entry(&new_ns->list, struct mount,
-                                           mnt_list)->mnt_id;
-
+                      first_entry_mnt_id = list_first_entry(&new_ns->list, struct mount, mnt_list)->mnt_id;
                       list_for_each_entry(q, &new_ns->list, mnt_list) {
-                          if (unlikely(
-                                  q->mnt.mnt_root->d_inode->i_state &
-                                  33554432))
+                          if (unlikely(q->mnt.mnt_root->d_inode->i_state & 33554432))
                               continue;
-
-                          q->mnt.android_kabi_reserved1 =
-                              first_entry_mnt_id++;
-
+                          q->mnt.android_kabi_reserved1 = first_entry_mnt_id++;
                           if (q->mnt_master) {
-                              if (likely(last_mnt_master_group_id !=
-                                         q->mnt_master->mnt_group_id)) {
-                                  q->mnt.android_kabi_reserved2 =
-                                      first_entry_mnt_master_group_id++;
-                              } else {
-                                  q->mnt.android_kabi_reserved2 =
-                                      first_entry_mnt_master_group_id;
-                              }
-
-                              last_mnt_master_group_id =
-                                  q->mnt.android_kabi_reserved2;
+                              if (likely(last_mnt_master_group_id != q->mnt_master->mnt_group_id))
+                                  q->mnt.android_kabi_reserved2 = first_entry_mnt_master_group_id++;
+                              else
+                                  q->mnt.android_kabi_reserved2 = first_entry_mnt_master_group_id;
+                              last_mnt_master_group_id = q->mnt.android_kabi_reserved2;
                           }
                       }
-
-                      current->android_kabi_reserved4 =
-                          first_entry_mnt_id;
+                      current->android_kabi_reserved4 = first_entry_mnt_id;
                   }
               }
           #endif
           '''
 
-          src = insert_after_anchor(
-              src,
-              "vfs_kern_mount",
-              (
-                  "mnt->mnt_parent = mnt;",
-                  "mnt->mnt.mnt_parent = mnt;",
-              ),
-              vfs_block,
-              "vfs_kern_mount",
-          )
+          parent_anchor=re.compile(r'mnt\s*->\s*mnt(?:\.)mnt_parent\s*=\s*mnt\s*;')
+          src=insert_once(src,'vfs_kern_mount',parent_anchor,vfs_block)
+          src=insert_once(src,'clone_mnt',parent_anchor,clone_block)
 
-          src = insert_after_anchor(
-              src,
-              "clone_mnt",
-              (
-                  "mnt->mnt_parent = mnt;",
-                  "mnt->mnt.mnt_parent = mnt;",
-              ),
-              clone_block,
-              "clone_mnt",
-          )
-
-          # Insert the namespace fake-id pass immediately before the
-          # namespace unlock at the end of copy_mnt_ns().
-          start, end, body = function_body(src, "copy_mnt_ns")
-
-          if "CONFIG_KSU_SUSFS_SUS_MOUNT" not in body:
-              needle = "namespace_unlock();"
-
-              if body.count(needle) != 1:
-                  raise SystemExit(
-                      "copy_mnt_ns: expected exactly one namespace_unlock(), "
-                      f"found {body.count(needle)}"
-                  )
-
-              pos = body.find(needle)
-              body = body[:pos] + copy_block + "\n" + body[pos:]
-              src = src[:start] + body + src[end:]
+          start,end,body=function_body(src,'copy_mnt_ns')
+          if 'SUSFS: reorder mounts created by zygote' not in body:
+              hits=list(re.finditer(r'(?m)^\s*namespace_unlock\(\);\s*$',body))
+              if len(hits)!=1:
+                  raise SystemExit(f'copy_mnt_ns: expected exactly one namespace_unlock(), found {len(hits)}')
+              p=hits[0].start()
+              body=body[:p]+copy_block+'\n'+body[p:]
+              src=src[:start]+body+src[end:]
 
           path.write_text(src)
           PY
 
-          grep -q             'SUSFS: reorder mounts created by zygote'             fs/namespace.c
-
-          grep -q             'android_kabi_reserved4 = first_entry_mnt_id'             fs/namespace.c
-
-          echo "SUSFS namespace structural adaptation: PASS"
+          grep -q 'SUSFS: reorder mounts created by zygote' fs/namespace.c
+          grep -q 'android_kabi_reserved4 = first_entry_mnt_id' fs/namespace.c
+          echo 'SUSFS namespace structural adaptation: PASS'
 
       # ============================================================
       # 10. KERNELSU MANUAL SYSCALL HOOKS
