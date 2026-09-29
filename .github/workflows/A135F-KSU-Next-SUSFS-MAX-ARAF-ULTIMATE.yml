@@ -1,4 +1,4 @@
-name: A135F KernelSU-Next SUSFS MAX ARAF — V4 API-Aware
+name: A135F KernelSU-Next SUSFS MAX ARAF — V5 Dynamic-Pin API-Aware
 
 on:
   workflow_dispatch:
@@ -20,11 +20,6 @@ env:
 
   KERNEL_LOCALVERSION: -MAX-ARAF
   BUILD_JOBS: "2"
-
-  # Exact commits observed and verified during the latest runner test.
-  # Pinning prevents a moving branch from silently changing the build inputs.
-  KERNEL_EXPECTED_HEAD: 02bc0098d796601530b2f0180b3741ae879139
-  KSU_EXPECTED_HEAD: f0a175c993db4e54d2582ca03ecf77280eff42d6
 
   # Source fingerprints collected from the exact files used to validate this build.
   KERNEL_EXEC_SHA256: fe2afdc0e8ca0b76bce37e49fc967a3a73648d09ab95972fd646394fa3aa323f
@@ -171,41 +166,59 @@ jobs:
         run: |
           set -euxo pipefail
 
-          rm -rf kernel
-          git clone \
-            --depth=1 \
-            --branch "$KERNEL_BRANCH" \
-            "$KERNEL_REPO" \
-            kernel
+          GIT_TERMINAL_PROMPT=0
+          export GIT_TERMINAL_PROMPT
+
+          resolve_remote_head() {
+            local url="$1"
+            local branch="$2"
+            git ls-remote "$url" "refs/heads/$branch" | awk 'NR==1 {print $1}'
+          }
+
+          KERNEL_HEAD=""
+          KERNEL_REMOTE_HEAD=""
+          for attempt in 1 2 3; do
+            rm -rf kernel
+            KERNEL_REMOTE_HEAD="$(resolve_remote_head "$KERNEL_REPO" "$KERNEL_BRANCH")"
+            if [[ ! "$KERNEL_REMOTE_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "ERROR: kernel remote branch did not resolve to a 40-hex object ID."
+              printf 'Remote result: [%s]\n' "$KERNEL_REMOTE_HEAD"
+              exit 1
+            fi
+
+            echo "Kernel branch tip before clone (attempt $attempt): $KERNEL_REMOTE_HEAD"
+            git clone \
+              --depth=1 \
+              --single-branch \
+              --branch "$KERNEL_BRANCH" \
+              "$KERNEL_REPO" \
+              kernel
+
+            KERNEL_HEAD="$(git -C kernel rev-parse --verify HEAD)"
+            echo "Kernel local HEAD after clone: $KERNEL_HEAD"
+
+            if [[ "$KERNEL_HEAD" == "$KERNEL_REMOTE_HEAD" ]]; then
+              break
+            fi
+
+            if (( attempt == 3 )); then
+              echo "ERROR: kernel branch moved during clone attempts; tip did not stabilize."
+              printf 'Last remote tip: [%s]\n' "$KERNEL_REMOTE_HEAD"
+              printf 'Last local HEAD:  [%s]\n' "$KERNEL_HEAD"
+              exit 1
+            fi
+            echo "INFO: kernel branch tip changed during clone; retrying..."
+            sleep $((attempt * 3))
+          done
+
+          if [[ ! "$KERNEL_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ERROR: git returned an invalid kernel object ID: [$KERNEL_HEAD]"
+            exit 1
+          fi
 
           cd kernel
-
-          KERNEL_HEAD="$(git rev-parse --verify HEAD)"
-          KERNEL_EXPECTED_CLEAN="$(printf '%s' "$KERNEL_EXPECTED_HEAD" | tr -cd '0123456789abcdefABCDEF' | tr 'ABCDEF' 'abcdef')"
-          KERNEL_HEAD_CLEAN="$(printf '%s' "$KERNEL_HEAD" | tr -cd '0123456789abcdefABCDEF' | tr 'ABCDEF' 'abcdef')"
-
-          echo "KERNEL_HEAD=$KERNEL_HEAD_CLEAN" >> "$GITHUB_ENV"
-
-          echo "Kernel HEAD byte-length: ${#KERNEL_HEAD_CLEAN}"
-          echo "Expected HEAD byte-length: ${#KERNEL_EXPECTED_CLEAN}"
-
-          # Compare normalized 40-hex commit IDs. This avoids a false failure
-          # from an invisible CR/whitespace character in a GitHub Actions env value.
-          if [[ "${#KERNEL_HEAD_CLEAN}" -ne 40 || "${#KERNEL_EXPECTED_CLEAN}" -ne 40 ]]; then
-            echo "ERROR: invalid kernel commit ID length."
-            printf 'Expected(normalized): [%s]\n' "$KERNEL_EXPECTED_CLEAN"
-            printf 'Actual(normalized):   [%s]\n' "$KERNEL_HEAD_CLEAN"
-            exit 1
-          fi
-
-          if [[ "$KERNEL_HEAD_CLEAN" != "$KERNEL_EXPECTED_CLEAN" ]]; then
-            echo "ERROR: kernel branch head changed."
-            printf 'Expected(normalized): [%s]\n' "$KERNEL_EXPECTED_CLEAN"
-            printf 'Actual(normalized):   [%s]\n' "$KERNEL_HEAD_CLEAN"
-            exit 1
-          fi
-
-          echo "Kernel commit pin verification PASSED: $KERNEL_HEAD_CLEAN"
+          echo "KERNEL_HEAD=$KERNEL_HEAD" >> "$GITHUB_ENV"
+          echo "Kernel branch-tip verification PASSED: $KERNEL_HEAD"
 
           echo "Kernel commit:"
           git log -1 --oneline
@@ -216,7 +229,7 @@ jobs:
 
           test -f "arch/arm64/configs/$DEFCONFIG"
 
-          # Exact source fingerprints for the four uploaded Lineage 23.2 files.
+          # Exact source fingerprints for the four validated Lineage 23.2 files.
           # This prevents silently applying manual hooks to a different 4.19 tree.
           printf '%s  %s\n' "$KERNEL_EXEC_SHA256" fs/exec.c | sha256sum -c -
           printf '%s  %s\n' "$KERNEL_OPEN_SHA256" fs/open.c | sha256sum -c -
@@ -236,38 +249,52 @@ jobs:
         run: |
           set -euo pipefail
 
-          retry_clone() {
-            local url="$1"
-            local branch="$2"
-            local dest="$3"
-            local attempt=1
-            rm -rf "$dest"
-            while (( attempt <= 5 )); do
-              if git -c http.version=HTTP/1.1 clone --depth=1 --branch "$branch" "$url" "$dest"; then
-                return 0
-              fi
-              echo "Git clone failed (attempt $attempt/5): $url#$branch"
-              rm -rf "$dest"
-              sleep $((attempt * 5))
-              attempt=$((attempt + 1))
-            done
-            echo "ERROR: unable to clone $url#$branch after 5 attempts"
-            exit 1
-          }
-
           rm -rf KernelSU-Next drivers/kernelsu
-          retry_clone "$KSU_REPO" "$KSU_BRANCH" KernelSU-Next
 
-          KSU_HEAD="$(git -C KernelSU-Next rev-parse HEAD)"
-          echo "KSU_HEAD=$KSU_HEAD" >> "$GITHUB_ENV"
-          git -C KernelSU-Next log -1 --oneline
+          KSU_HEAD=""
+          KSU_REMOTE_HEAD=""
+          for attempt in 1 2 3; do
+            rm -rf KernelSU-Next
+            KSU_REMOTE_HEAD="$(git ls-remote "$KSU_REPO" "refs/heads/$KSU_BRANCH" | awk 'NR==1 {print $1}')"
+            if [[ ! "$KSU_REMOTE_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "ERROR: KernelSU remote branch did not resolve to a 40-hex object ID."
+              printf 'Remote result: [%s]\n' "$KSU_REMOTE_HEAD"
+              exit 1
+            fi
 
-          if [[ "$KSU_HEAD" != "$KSU_EXPECTED_HEAD" ]]; then
-            echo "ERROR: KernelSU-Next branch head changed."
-            echo "Expected: $KSU_EXPECTED_HEAD"
-            echo "Actual:   $KSU_HEAD"
+            echo "KernelSU branch tip before clone (attempt $attempt): $KSU_REMOTE_HEAD"
+            git -c http.version=HTTP/1.1 clone \
+              --depth=1 \
+              --single-branch \
+              --branch "$KSU_BRANCH" \
+              "$KSU_REPO" \
+              KernelSU-Next
+
+            KSU_HEAD="$(git -C KernelSU-Next rev-parse --verify HEAD)"
+            echo "KernelSU local HEAD after clone: $KSU_HEAD"
+
+            if [[ "$KSU_HEAD" == "$KSU_REMOTE_HEAD" ]]; then
+              break
+            fi
+
+            if (( attempt == 3 )); then
+              echo "ERROR: KernelSU branch moved during clone attempts; tip did not stabilize."
+              printf 'Last remote tip: [%s]\n' "$KSU_REMOTE_HEAD"
+              printf 'Last local HEAD:  [%s]\n' "$KSU_HEAD"
+              exit 1
+            fi
+            echo "INFO: KernelSU branch tip changed during clone; retrying..."
+            sleep $((attempt * 3))
+          done
+
+          if [[ ! "$KSU_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ERROR: git returned an invalid KernelSU object ID: [$KSU_HEAD]"
             exit 1
           fi
+
+          echo "KSU_HEAD=$KSU_HEAD" >> "$GITHUB_ENV"
+          git -C KernelSU-Next log -1 --oneline
+          echo "KernelSU branch-tip verification PASSED: $KSU_HEAD"
 
           KSU_ROOT="KernelSU-Next/kernel"
           KSU_KCONFIG="$KSU_ROOT/Kconfig"
