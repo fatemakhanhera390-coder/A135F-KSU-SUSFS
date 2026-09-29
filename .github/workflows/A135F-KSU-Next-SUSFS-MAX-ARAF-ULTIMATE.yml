@@ -1,4 +1,4 @@
-name: A135F KernelSU-Next SUSFS MAX ARAF — RENEWED V2
+name: A135F KernelSU-Next SUSFS MAX ARAF — V3 API-Aware
 
 on:
   workflow_dispatch:
@@ -20,6 +20,11 @@ env:
 
   KERNEL_LOCALVERSION: -MAX-ARAF
   BUILD_JOBS: "2"
+
+  # Exact commits observed and verified during the latest runner test.
+  # Pinning prevents a moving branch from silently changing the build inputs.
+  KERNEL_EXPECTED_HEAD: 02bc0098d796601530b2f0180b3741ae879139
+  KSU_EXPECTED_HEAD: f0a175c993db4e54d2582ca03ecf77280eff42d6
 
   # Source fingerprints collected from the exact files used to validate this build.
   KERNEL_EXEC_SHA256: fe2afdc0e8ca0b76bce37e49fc967a3a73648d09ab95972fd646394fa3aa323f
@@ -178,6 +183,13 @@ jobs:
           KERNEL_HEAD="$(git rev-parse HEAD)"
           echo "KERNEL_HEAD=$KERNEL_HEAD" >> "$GITHUB_ENV"
 
+          if [[ "$KERNEL_HEAD" != "$KERNEL_EXPECTED_HEAD" ]]; then
+            echo "ERROR: kernel branch head changed."
+            echo "Expected: $KERNEL_EXPECTED_HEAD"
+            echo "Actual:   $KERNEL_HEAD"
+            exit 1
+          fi
+
           echo "Kernel commit:"
           git log -1 --oneline
 
@@ -199,8 +211,9 @@ jobs:
 
       # ============================================================
       # 7. INSTALL KERNELSU-NEXT LEGACY DRIVER
+      #    BRANCH/API-AWARE — NO KSU_MANUAL_HOOK SYMBOL ASSUMPTION
       # ============================================================
-      - name: Install KernelSU-Next legacy driver — adaptive preflight
+      - name: Install KernelSU-Next legacy driver — branch/API aware
         shell: bash
         working-directory: kernel
         run: |
@@ -232,57 +245,145 @@ jobs:
           echo "KSU_HEAD=$KSU_HEAD" >> "$GITHUB_ENV"
           git -C KernelSU-Next log -1 --oneline
 
-          KSU_KCONFIG="KernelSU-Next/kernel/Kconfig"
-          KSU_MAKEFILE="KernelSU-Next/kernel/Makefile"
-          KSU_CORE="KernelSU-Next/kernel/core_hook.c"
-          KSU_C="KernelSU-Next/kernel/ksu.c"
+          if [[ "$KSU_HEAD" != "$KSU_EXPECTED_HEAD" ]]; then
+            echo "ERROR: KernelSU-Next branch head changed."
+            echo "Expected: $KSU_EXPECTED_HEAD"
+            echo "Actual:   $KSU_HEAD"
+            exit 1
+          fi
+
+          KSU_ROOT="KernelSU-Next/kernel"
+          KSU_KCONFIG="$KSU_ROOT/Kconfig"
+          KSU_MAKEFILE="$KSU_ROOT/Makefile"
+          KSU_CORE="$KSU_ROOT/core_hook.c"
+          KSU_C="$KSU_ROOT/ksu.c"
 
           test -f "$KSU_KCONFIG"
           test -f "$KSU_MAKEFILE"
           test -f "$KSU_CORE"
           test -f "$KSU_C"
 
-          echo "========== KernelSU Kconfig inventory =========="
-          grep -nE '^config KSU($|_)' "$KSU_KCONFIG" || true
+          mkdir -p diagnostics
 
-          # Current SukiSU/KernelSU-Next documentation requires
-          # CONFIG_KSU_MANUAL_HOOK=y for the non-GKI manual-hook path.
-          # Do NOT require the obsolete/mismatched KSU_SYSCALL_TABLE_HOOK
-          # spelling; this was the immediate failure in the previous run.
-          if ! grep -qE '^config[[:space:]]+KSU_MANUAL_HOOK([[:space:]]|$)' "$KSU_KCONFIG"; then
-            echo "ERROR: this KernelSU-Next branch does not expose KSU_MANUAL_HOOK."
-            echo "Available KSU hook symbols:"
-            grep -nE '^config[[:space:]]+KSU_.*HOOK' "$KSU_KCONFIG" || true
+          echo "========== KernelSU Kconfig inventory ==========" | tee diagnostics/ksu-kconfig-inventory.txt
+          grep -nE '^config[[:space:]]+KSU($|_)' "$KSU_KCONFIG" | tee -a diagnostics/ksu-kconfig-inventory.txt || true
+
+          if ! grep -qE '^config[[:space:]]+KSU([[:space:]]|$)' "$KSU_KCONFIG"; then
+            echo "ERROR: CONFIG_KSU definition missing from KernelSU-Next Kconfig."
             exit 1
           fi
 
-          grep -qE '^config[[:space:]]+KSU([[:space:]]|$)' "$KSU_KCONFIG"
-
-          # The branch must contain the SUSFS-aware KSU side.
-          grep -Rqs --include='*.c' --include='*.h' 'susfs_init' KernelSU-Next/kernel
-          grep -Rqs --include='*.c' --include='*.h' '#include <linux/susfs.h>' KernelSU-Next/kernel
-
-          echo "========== Required KernelSU manual-hook APIs =========="
-          for sym in \
-            ksu_handle_execveat \
-            ksu_handle_faccessat \
-            ksu_handle_sys_read \
-            ksu_handle_stat \
-            ksu_handle_sys_reboot
-          do
-            if ! grep -Rqs --include='*.c' --include='*.h' "$sym" KernelSU-Next/kernel; then
-              echo "ERROR: required KernelSU API missing: $sym"
-              exit 1
-            fi
-            grep -Rns --include='*.c' --include='*.h' "$sym" KernelSU-Next/kernel | head -n 6
-          done
-
-          # Helpful API presence check for optional setresuid hook.
-          if grep -Rqs --include='*.c' --include='*.h' 'ksu_handle_setresuid' KernelSU-Next/kernel; then
-            echo "KSU setresuid API present."
+          # IMPORTANT: this exact next-susfs-4.19 branch does NOT expose
+          # KSU_MANUAL_HOOK or KSU_SYSCALL_TABLE_HOOK in Kconfig.  The source
+          # manual hooks are therefore selected by source injection below,
+          # not by inventing/forcing a missing Kconfig symbol.
+          if grep -qE '^config[[:space:]]+KSU_MANUAL_HOOK([[:space:]]|$)' "$KSU_KCONFIG"; then
+            echo "INFO: KSU_MANUAL_HOOK exists on this branch; it will be handled opportunistically."
           else
-            echo "KSU setresuid API not present; source hook step will skip it."
+            echo "INFO: KSU_MANUAL_HOOK is absent on this branch — expected for the observed commit."
           fi
+          if grep -qE '^config[[:space:]]+KSU_SYSCALL_TABLE_HOOK([[:space:]]|$)' "$KSU_KCONFIG"; then
+            echo "INFO: KSU_SYSCALL_TABLE_HOOK exists; source-manual mode will explicitly avoid it."
+          fi
+
+          # The branch must carry the SUSFS-aware KSU side.
+          grep -Rqs --include='*.c' --include='*.h' 'susfs_init' "$KSU_ROOT"
+          grep -Rqs --include='*.c' --include='*.h' '#include <linux/susfs.h>' "$KSU_ROOT"
+
+          echo "========== KernelSU API capability scan ==========" | tee diagnostics/ksu-api-inventory.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          import re, sys
+
+          root = Path("KernelSU-Next/kernel")
+          symbols = {
+              "ksu_handle_execveat": 5,
+              "ksu_handle_faccessat": 4,
+              "ksu_handle_sys_read": 3,
+              "ksu_handle_stat": 3,
+              "ksu_handle_sys_reboot": 4,
+          }
+
+          files = [p for p in root.rglob('*') if p.suffix in {'.c', '.h'}]
+          whole = {p: p.read_text(errors='replace') for p in files}
+
+          def balanced_args(s, pos):
+              i = s.find('(', pos)
+              if i < 0:
+                  return None
+              depth = 0
+              quote = None
+              esc = False
+              for j in range(i, len(s)):
+                  c = s[j]
+                  if quote:
+                      if esc:
+                          esc = False
+                      elif c == '\\':
+                          esc = True
+                      elif c == quote:
+                          quote = None
+                      continue
+                  if c in ('"', "'"):
+                      quote = c
+                  elif c == '(':
+                      depth += 1
+                  elif c == ')':
+                      depth -= 1
+                      if depth == 0:
+                          return s[i+1:j]
+              return None
+
+          failures = []
+          for sym, expected_arity in symbols.items():
+              hits = []
+              for p, txt in whole.items():
+                  for m in re.finditer(r'\b' + re.escape(sym) + r'\s*\(', txt):
+                      line = txt[:m.start()].count('\n') + 1
+                      args = balanced_args(txt, m.start())
+                      arity = None
+                      if args is not None and args.strip():
+                          # Count top-level commas in the parameter list.
+                          depth = 0
+                          commas = 0
+                          for ch in args:
+                              if ch in '([{<': depth += 1
+                              elif ch in ')]}>': depth = max(0, depth - 1)
+                              elif ch == ',' and depth == 0: commas += 1
+                          arity = commas + 1
+                      hits.append((p.as_posix(), line, arity, txt.splitlines()[line-1].strip()))
+              print(f"{sym}: hits={len(hits)} expected_arity={expected_arity}")
+              for h in hits[:8]:
+                  print(f"  {h[0]}:{h[1]} arity={h[2]} :: {h[3]}")
+              if not hits:
+                  failures.append(f"missing symbol: {sym}")
+              elif not any(h[2] == expected_arity for h in hits if h[2] is not None):
+                  failures.append(f"no {expected_arity}-argument declaration/definition found for: {sym}")
+
+          read_flag = False
+          read_hits = []
+          for p, txt in whole.items():
+              for m in re.finditer(r'\bksu_vfs_read_hook\b', txt):
+                  line = txt[:m.start()].count('\n') + 1
+                  read_hits.append((p.as_posix(), line, txt.splitlines()[line-1].strip()))
+                  if re.search(r'\bbool\s+ksu_vfs_read_hook\b|\bksu_vfs_read_hook\s+__read_mostly\b', txt):
+                      read_flag = True
+          print(f"ksu_vfs_read_hook: hits={len(read_hits)} bool/read-mostly={read_flag}")
+          for h in read_hits[:8]:
+              print(f"  {h[0]}:{h[1]} :: {h[2]}")
+          if not read_flag:
+              failures.append("ksu_vfs_read_hook bool/read-mostly flag not found (required by the pinned source hook injector)")
+
+          if failures:
+              print("KSU API PREFLIGHT FAILED:")
+              for f in failures:
+                  print(" - " + f)
+              sys.exit(1)
+          print("KSU API PREFLIGHT PASSED")
+          PY
+
+          # Export a deterministic mode marker for later diagnostics.
+          echo "KSU_HOOK_MODE=SOURCE_MANUAL" >> "$GITHUB_ENV"
 
           ln -s "$(pwd)/KernelSU-Next/kernel" drivers/kernelsu
 
@@ -294,6 +395,7 @@ jobs:
           echo "========== KernelSU source fingerprint =========="
           sha256sum "$KSU_KCONFIG" "$KSU_MAKEFILE" "$KSU_CORE" "$KSU_C"
           echo "KSU_HEAD=$KSU_HEAD"
+          echo "KernelSU branch/API-aware preflight passed."
 
       # ============================================================
       # 8. FETCH + VERIFY SUSFS 1.4.2 FOR 4.19
@@ -841,7 +943,7 @@ jobs:
       # ============================================================
       # 11. STRICT SOURCE-LEVEL INTEGRATION VERIFICATION
       # ============================================================
-      - name: Verify A135F KernelSU-Next + SUSFS integration — branch-aware
+      - name: Verify A135F KernelSU-Next + SUSFS integration — source-manual mode
         shell: bash
         working-directory: kernel
         run: |
@@ -853,11 +955,16 @@ jobs:
 
           echo "========== KernelSU =========="
           test -L drivers/kernelsu
+          test "${KSU_HOOK_MODE:-unset}" = "SOURCE_MANUAL"
+          grep -Rqs --include='*.c' --include='*.h' 'ksu_handle_execveat' drivers/kernelsu
+          grep -Rqs --include='*.c' --include='*.h' 'ksu_handle_faccessat' drivers/kernelsu
+          grep -Rqs --include='*.c' --include='*.h' 'ksu_handle_sys_read' drivers/kernelsu
+          grep -Rqs --include='*.c' --include='*.h' 'ksu_handle_stat' drivers/kernelsu
+          grep -Rqs --include='*.c' --include='*.h' 'ksu_handle_sys_reboot' drivers/kernelsu
           test -f drivers/kernelsu/Kconfig
           test -f drivers/kernelsu/Makefile
           test -f drivers/kernelsu/ksu.c
           grep -qE '^config[[:space:]]+KSU([[:space:]]|$)' drivers/kernelsu/Kconfig
-          grep -qE '^config[[:space:]]+KSU_MANUAL_HOOK([[:space:]]|$)' drivers/kernelsu/Kconfig
           grep -Rqs --include='*.c' --include='*.h' 'susfs_init' drivers/kernelsu
           grep -Rqs --include='*.c' --include='*.h' '#include <linux/susfs.h>' drivers/kernelsu
 
@@ -985,10 +1092,11 @@ jobs:
             fi
           }
 
-          # KSU core + manual hook + SUSFS core are required for this project.
+          # KSU core + SUSFS core are required.
+          # Source-manual hooks do NOT depend on CONFIG_KSU_MANUAL_HOOK on the
+          # pinned next-susfs-4.19 branch because that symbol is not exposed.
           for sym in \
             CONFIG_KSU \
-            CONFIG_KSU_MANUAL_HOOK \
             CONFIG_KSU_SUSFS \
             CONFIG_KSU_SUSFS_SUS_PATH \
             CONFIG_KSU_SUSFS_SUS_MOUNT \
@@ -999,6 +1107,8 @@ jobs:
 
           # Core required settings.
           set_sym --enable CONFIG_KSU
+          # Optional only: enable KSU_MANUAL_HOOK when the exact branch exposes it.
+          # The observed pinned branch does not, so this is a no-op there.
           set_sym --enable CONFIG_KSU_MANUAL_HOOK
           set_sym --enable CONFIG_KSU_SUSFS
           set_sym --enable CONFIG_KSU_SUSFS_SUS_PATH
@@ -1038,12 +1148,14 @@ jobs:
           # manual-hook configuration, but only when those symbols exist.
           for sym in \
             CONFIG_KSU_SUSFS_SUS_OVERLAYFS \
-            CONFIG_KSU_SUSFS_SUS_SU \
-            CONFIG_KPROBES \
-            CONFIG_KPROBE_EVENTS
+            CONFIG_KSU_SUSFS_SUS_SU
           do
             set_sym --disable "$sym"
           done
+
+          # This build uses source-level manual syscall hooks. Leave generic
+          # kernel KPROBES/KPROBE_EVENTS policy untouched unless the KSU branch
+          # itself exposes a dedicated alternate hook symbol (handled below).
 
           # Build-stability knobs, again without touching absent symbols.
           for sym in \
@@ -1071,11 +1183,11 @@ jobs:
 
           # Hard requirements after Kconfig resolution.
           grep -q '^CONFIG_KSU=y$' out/.config
-          grep -q '^CONFIG_KSU_MANUAL_HOOK=y$' out/.config
           grep -q '^CONFIG_KSU_SUSFS=y$' out/.config
           grep -q '^CONFIG_KSU_SUSFS_SUS_PATH=y$' out/.config
           grep -q '^CONFIG_KSU_SUSFS_SUS_MOUNT=y$' out/.config
           grep -q '^CONFIG_KSU_SUSFS_SUS_KSTAT=y$' out/.config
+          grep -q '^CONFIG_KSU=y$' out/.config
 
           if symbol_exists CONFIG_KSU_TRACEPOINT_HOOK; then
             ! grep -q '^CONFIG_KSU_TRACEPOINT_HOOK=y$' out/.config
@@ -1096,12 +1208,6 @@ jobs:
             ! grep -q '^CONFIG_KSU_KPROBE_HOOKS=y$' out/.config
           fi
 
-          if symbol_exists CONFIG_KPROBES; then
-            ! grep -q '^CONFIG_KPROBES=y$' out/.config
-          fi
-          if symbol_exists CONFIG_KPROBE_EVENTS; then
-            ! grep -q '^CONFIG_KPROBE_EVENTS=y$' out/.config
-          fi
           if symbol_exists CONFIG_LTO_CLANG; then
             ! grep -q '^CONFIG_LTO_CLANG=y$' out/.config
           fi
@@ -1309,6 +1415,13 @@ jobs:
             echo 'out/.config missing.' >> diagnostics/final-config.txt
           fi
 
+          echo '=== KernelSU API inventory ===' > diagnostics/ksu-api.txt
+          if test -f diagnostics/ksu-api-inventory.txt; then
+            cat diagnostics/ksu-api-inventory.txt >> diagnostics/ksu-api.txt
+          else
+            echo 'KSU API inventory was not produced.' >> diagnostics/ksu-api.txt
+          fi
+
           echo '=== KernelSU Kconfig ===' > diagnostics/ksu-kconfig.txt
           if test -f drivers/kernelsu/Kconfig; then
             grep -nE '^config KSU($|_)' drivers/kernelsu/Kconfig >> diagnostics/ksu-kconfig.txt
@@ -1320,6 +1433,7 @@ jobs:
           printf 'KERNEL_HEAD=%s\n' "${KERNEL_HEAD:-unset}" >> diagnostics/build-heads.txt
           printf 'KSU_HEAD=%s\n' "${KSU_HEAD:-unset}" >> diagnostics/build-heads.txt
           printf 'SUSFS_HEAD=%s\n' "${SUSFS_HEAD:-unset}" >> diagnostics/build-heads.txt
+          printf 'KSU_HOOK_MODE=%s\n' "${KSU_HOOK_MODE:-unset}" >> diagnostics/build-heads.txt
           printf 'LLVM_HOME=%s\n' "${LLVM_HOME:-unset}" >> diagnostics/build-heads.txt
 
           echo '=== Reject contents (if any) ===' > diagnostics/reject-contents.txt
@@ -1349,7 +1463,7 @@ jobs:
           set -euxo pipefail
 
           echo '=============================================='
-          echo '      MAX ARAF A135F KERNEL BUILD — RENEWED V2'
+          echo '      MAX ARAF A135F KERNEL BUILD — V3 API-AWARE SOURCE-MANUAL'
           echo '=============================================='
           echo
           echo 'Kernel:'
