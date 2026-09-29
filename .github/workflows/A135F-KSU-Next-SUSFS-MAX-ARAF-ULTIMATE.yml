@@ -1,4 +1,4 @@
-name: A135F KernelSU-Next SUSFS MAX ARAF — V3 API-Aware
+name: A135F KernelSU-Next SUSFS MAX ARAF — V4 API-Aware
 
 on:
   workflow_dispatch:
@@ -180,15 +180,32 @@ jobs:
 
           cd kernel
 
-          KERNEL_HEAD="$(git rev-parse HEAD)"
-          echo "KERNEL_HEAD=$KERNEL_HEAD" >> "$GITHUB_ENV"
+          KERNEL_HEAD="$(git rev-parse --verify HEAD)"
+          KERNEL_EXPECTED_CLEAN="$(printf '%s' "$KERNEL_EXPECTED_HEAD" | tr -cd '0123456789abcdefABCDEF' | tr 'ABCDEF' 'abcdef')"
+          KERNEL_HEAD_CLEAN="$(printf '%s' "$KERNEL_HEAD" | tr -cd '0123456789abcdefABCDEF' | tr 'ABCDEF' 'abcdef')"
 
-          if [[ "$KERNEL_HEAD" != "$KERNEL_EXPECTED_HEAD" ]]; then
-            echo "ERROR: kernel branch head changed."
-            echo "Expected: $KERNEL_EXPECTED_HEAD"
-            echo "Actual:   $KERNEL_HEAD"
+          echo "KERNEL_HEAD=$KERNEL_HEAD_CLEAN" >> "$GITHUB_ENV"
+
+          echo "Kernel HEAD byte-length: ${#KERNEL_HEAD_CLEAN}"
+          echo "Expected HEAD byte-length: ${#KERNEL_EXPECTED_CLEAN}"
+
+          # Compare normalized 40-hex commit IDs. This avoids a false failure
+          # from an invisible CR/whitespace character in a GitHub Actions env value.
+          if [[ "${#KERNEL_HEAD_CLEAN}" -ne 40 || "${#KERNEL_EXPECTED_CLEAN}" -ne 40 ]]; then
+            echo "ERROR: invalid kernel commit ID length."
+            printf 'Expected(normalized): [%s]\n' "$KERNEL_EXPECTED_CLEAN"
+            printf 'Actual(normalized):   [%s]\n' "$KERNEL_HEAD_CLEAN"
             exit 1
           fi
+
+          if [[ "$KERNEL_HEAD_CLEAN" != "$KERNEL_EXPECTED_CLEAN" ]]; then
+            echo "ERROR: kernel branch head changed."
+            printf 'Expected(normalized): [%s]\n' "$KERNEL_EXPECTED_CLEAN"
+            printf 'Actual(normalized):   [%s]\n' "$KERNEL_HEAD_CLEAN"
+            exit 1
+          fi
+
+          echo "Kernel commit pin verification PASSED: $KERNEL_HEAD_CLEAN"
 
           echo "Kernel commit:"
           git log -1 --oneline
